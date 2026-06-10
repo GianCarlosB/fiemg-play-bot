@@ -1,0 +1,853 @@
+// FIEMGPlayBot.cs
+// Auto-liker para o feed do FIEMG Play (Cluube), construido sobre ZK Framework.
+//
+// SEM dependencias externas: pilota o Microsoft Edge (ja instalado no Windows)
+// pelo Chrome DevTools Protocol (CDP) via WebSocket, usando APENAS a Base Class
+// Library do .NET Framework 4.x (ClientWebSocket, HttpClient, JavaScriptSerializer).
+//
+// Compilado com o csc.exe in-box do Windows (C# 5). Ver run.bat.
+//
+// Uso etico: este script automatiza acoes na PROPRIA conta do usuario. Ele espaca
+// as requisicoes para nao sobrecarregar o servidor e reduzir risco de bloqueio.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+
+namespace FIEMGPlayBot
+{
+    // ---------------------------------------------------------------------
+    // Configuracao (lida de config.json)
+    // ---------------------------------------------------------------------
+    class Config
+    {
+        public string LoginUrl = "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true";
+        public string FeedUrl = "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true";
+        public string Email = "";
+        public string Password = "";
+        public int EdgePort = 9222;
+        public bool Headless = true;
+        public bool BlockImages = false;     // desligar imagens economiza RAM, mas pode quebrar o clique nos coracoes
+        public int MinDelayMs = 2500;
+        public int MaxDelayMs = 6000;
+        public int LongPauseEveryLikes = 30;
+        public int LongPauseMs = 60000;
+        public int ReloadEveryLikes = 40;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria)
+        public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
+        public int MaxEmptyScrollRounds = 4; // rodadas seguidas sem posts novos => fim do feed
+        public int ScrollWaitMs = 2500;
+        public bool MaxHearts = true;        // SEMPRE clicar no coracao de maior valor (ultimo = "Amei"), robusto a qualquer quantidade
+        public int HeartIndex = 5;           // usado apenas quando MaxHearts=false. 1..5 (5="Amei")
+        public string DoneFile = "done.txt";
+        public bool Verbose = false;         // logs de diagnostico detalhados (login/feed)
+        public int StopAfterNoGain = 10;     // se os pontos nao subirem em N avaliacoes seguidas, para (provavel teto diario). 0 = desliga
+
+        public static Config Load(string path)
+        {
+            var ser = new JavaScriptSerializer();
+            string json = File.ReadAllText(path, Encoding.UTF8);
+            var d = ser.DeserializeObject(json) as Dictionary<string, object>;
+            var c = new Config();
+            if (d == null) return c;
+            c.LoginUrl = Str(d, "loginUrl", c.LoginUrl);
+            c.FeedUrl = Str(d, "feedUrl", c.FeedUrl);
+            c.Email = Str(d, "email", c.Email);
+            c.Password = Str(d, "password", c.Password);
+            c.EdgePort = Int(d, "edgePort", c.EdgePort);
+            c.Headless = Bool(d, "headless", c.Headless);
+            c.BlockImages = Bool(d, "blockImages", c.BlockImages);
+            c.MinDelayMs = Int(d, "minDelayMs", c.MinDelayMs);
+            c.MaxDelayMs = Int(d, "maxDelayMs", c.MaxDelayMs);
+            c.LongPauseEveryLikes = Int(d, "longPauseEveryLikes", c.LongPauseEveryLikes);
+            c.LongPauseMs = Int(d, "longPauseMs", c.LongPauseMs);
+            c.ReloadEveryLikes = Int(d, "reloadEveryLikes", c.ReloadEveryLikes);
+            c.MaxLikes = Int(d, "maxLikes", c.MaxLikes);
+            c.MaxEmptyScrollRounds = Int(d, "maxEmptyScrollRounds", c.MaxEmptyScrollRounds);
+            c.ScrollWaitMs = Int(d, "scrollWaitMs", c.ScrollWaitMs);
+            c.MaxHearts = Bool(d, "maxHearts", c.MaxHearts);
+            c.HeartIndex = Int(d, "heartIndex", c.HeartIndex);
+            c.DoneFile = Str(d, "doneFile", c.DoneFile);
+            c.Verbose = Bool(d, "verbose", c.Verbose);
+            c.StopAfterNoGain = Int(d, "stopAfterNoGain", c.StopAfterNoGain);
+            return c;
+        }
+
+        static string Str(Dictionary<string, object> d, string k, string def)
+        { return d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : def; }
+        static int Int(Dictionary<string, object> d, string k, int def)
+        { return d.ContainsKey(k) && d[k] != null ? Convert.ToInt32(d[k]) : def; }
+        static bool Bool(Dictionary<string, object> d, string k, bool def)
+        { return d.ContainsKey(k) && d[k] != null ? Convert.ToBoolean(d[k]) : def; }
+    }
+
+    // ---------------------------------------------------------------------
+    // Cliente CDP minimo sobre WebSocket (request/response sequencial)
+    // ---------------------------------------------------------------------
+    class Cdp : IDisposable
+    {
+        readonly ClientWebSocket _ws = new ClientWebSocket();
+        readonly JavaScriptSerializer _ser = new JavaScriptSerializer();
+        public readonly List<string> Events = new List<string>();
+        int _id = 0;
+
+        public Cdp() { _ser.MaxJsonLength = 64 * 1024 * 1024; }
+
+        public async Task ConnectAsync(int port)
+        {
+            string wsUrl = await GetPageWsUrl(port);
+            await _ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+        }
+
+        async Task<string> GetPageWsUrl(int port)
+        {
+            using (var http = new HttpClient())
+            {
+                http.Timeout = TimeSpan.FromSeconds(5);
+                for (int attempt = 0; attempt < 80; attempt++)
+                {
+                    try
+                    {
+                        string s = await http.GetStringAsync("http://127.0.0.1:" + port + "/json");
+                        var arr = _ser.DeserializeObject(s) as object[];
+                        if (arr != null)
+                        {
+                            foreach (var o in arr)
+                            {
+                                var d = o as Dictionary<string, object>;
+                                if (d != null && d.ContainsKey("type") && Convert.ToString(d["type"]) == "page"
+                                    && d.ContainsKey("webSocketDebuggerUrl"))
+                                    return Convert.ToString(d["webSocketDebuggerUrl"]);
+                            }
+                        }
+                    }
+                    catch { /* Edge ainda subindo */ }
+                    await Task.Delay(500);
+                }
+            }
+            throw new Exception("Nao foi possivel obter o endpoint WebSocket do Edge (porta " + port + ").");
+        }
+
+        public async Task<Dictionary<string, object>> Send(string method, object prms)
+        {
+            int id = ++_id;
+            var msg = new Dictionary<string, object>();
+            msg["id"] = id;
+            msg["method"] = method;
+            if (prms != null) msg["params"] = prms;
+            string json = _ser.Serialize(msg);
+            await _ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)),
+                                WebSocketMessageType.Text, true, CancellationToken.None);
+
+            while (true)
+            {
+                string resp = await Receive();
+                var d = _ser.DeserializeObject(resp) as Dictionary<string, object>;
+                if (d == null) continue;
+                if (d.ContainsKey("id") && Convert.ToInt32(d["id"]) == id)
+                    return d; // resposta do nosso comando
+                // captura eventos de erro/log para diagnostico
+                if (d.ContainsKey("method"))
+                {
+                    string m = Convert.ToString(d["method"]);
+                    if ((m == "Runtime.exceptionThrown" || m == "Log.entryAdded") && Events.Count < 200)
+                    {
+                        object prm = d.ContainsKey("params") ? d["params"] : null;
+                        string s = prm != null ? _ser.Serialize(prm) : "";
+                        if (s.Length > 280) s = s.Substring(0, 280);
+                        Events.Add(m + " " + s);
+                    }
+                }
+            }
+        }
+
+        async Task<string> Receive()
+        {
+            var ms = new MemoryStream();
+            var buf = new byte[16384];
+            while (true)
+            {
+                var res = await _ws.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None);
+                if (res.MessageType == WebSocketMessageType.Close)
+                    throw new Exception("WebSocket fechado pelo Edge.");
+                ms.Write(buf, 0, res.Count);
+                if (res.EndOfMessage) break;
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+
+        // Avalia uma expressao JS e retorna o valor (string/num/bool) ou null.
+        public async Task<object> Eval(string expr)
+        {
+            var p = new Dictionary<string, object>();
+            p["expression"] = expr;
+            p["returnByValue"] = true;
+            p["awaitPromise"] = true;
+            var resp = await Send("Runtime.evaluate", p);
+            var result = resp.ContainsKey("result") ? resp["result"] as Dictionary<string, object> : null;
+            if (result == null) return null;
+            if (result.ContainsKey("exceptionDetails")) return null;
+            var inner = result.ContainsKey("result") ? result["result"] as Dictionary<string, object> : null;
+            if (inner == null) return null;
+            return inner.ContainsKey("value") ? inner["value"] : null;
+        }
+
+        public async Task<string> EvalStr(string expr)
+        {
+            object v = await Eval(expr);
+            return v == null ? null : Convert.ToString(v);
+        }
+
+        public async Task<int> EvalInt(string expr, int def)
+        {
+            object v = await Eval(expr);
+            if (v == null) return def;
+            try { return Convert.ToInt32(v); } catch { return def; }
+        }
+
+        public async Task Navigate(string url)
+        {
+            var p = new Dictionary<string, object>();
+            p["url"] = url;
+            await Send("Page.navigate", p);
+        }
+
+        // Clique "trusted" (o ZK ignora eventos sinteticos do JS, mas aceita input do CDP).
+        public async Task ClickAt(double x, double y)
+        {
+            await Mouse("mouseMoved", x, y, 0);
+            await Task.Delay(40);
+            await Mouse("mousePressed", x, y, 1);
+            await Task.Delay(50);
+            await Mouse("mouseReleased", x, y, 1);
+        }
+
+        async Task Mouse(string type, double x, double y, int clickCount)
+        {
+            var p = new Dictionary<string, object>();
+            p["type"] = type;
+            p["x"] = x;
+            p["y"] = y;
+            p["button"] = "left";
+            p["buttons"] = (type == "mousePressed") ? 1 : 0;
+            p["clickCount"] = clickCount;
+            await Send("Input.dispatchMouseEvent", p);
+        }
+
+        // Insere texto como input "trusted" (dispara eventos que o ZK escuta).
+        public async Task InsertText(string text)
+        {
+            var p = new Dictionary<string, object>();
+            p["text"] = text;
+            await Send("Input.insertText", p);
+        }
+
+        // Pressiona Enter (alguns modais ZK submetem no Enter; tambem forca blur/commit).
+        public async Task PressEnter()
+        {
+            var down = new Dictionary<string, object>();
+            down["type"] = "rawKeyDown"; down["windowsVirtualKeyCode"] = 13; down["key"] = "Enter"; down["code"] = "Enter";
+            await Send("Input.dispatchKeyEvent", down);
+            var up = new Dictionary<string, object>();
+            up["type"] = "keyUp"; up["windowsVirtualKeyCode"] = 13; up["key"] = "Enter"; up["code"] = "Enter";
+            await Send("Input.dispatchKeyEvent", up);
+        }
+
+        public async Task SetImagesEnabled(bool enabled)
+        {
+            // Bloqueia/permite carregamento de imagens via CDP (Network domain).
+            await Send("Network.enable", null);
+            var p = new Dictionary<string, object>();
+            if (enabled) p["urls"] = new string[] { };
+            else p["urls"] = new string[] { "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp" };
+            await Send("Network.setBlockedURLs", p);
+        }
+
+        public void Dispose()
+        {
+            try { if (_ws.State == WebSocketState.Open) _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None).Wait(2000); }
+            catch { }
+            try { _ws.Dispose(); } catch { }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Programa principal
+    // ---------------------------------------------------------------------
+    class Program
+    {
+        static readonly Random _rng = new Random();
+        static Config _cfg;
+        static Cdp _cdp;
+
+        static void Main()
+        {
+            try { MainAsync().GetAwaiter().GetResult(); }
+            catch (Exception ex) { Log("ERRO FATAL: " + ex.Message); }
+        }
+
+        static async Task MainAsync()
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string cfgPath = Path.Combine(baseDir, "config.json");
+            if (!File.Exists(cfgPath))
+            {
+                Log("config.json nao encontrado em " + baseDir + " - crie o arquivo (veja README.md).");
+                return;
+            }
+            _cfg = Config.Load(cfgPath);
+            if (string.IsNullOrEmpty(_cfg.Email) || string.IsNullOrEmpty(_cfg.Password))
+            {
+                Log("Preencha email e password em config.json.");
+                return;
+            }
+
+            string edge = FindEdge();
+            if (edge == null) { Log("msedge.exe nao encontrado. Instale o Microsoft Edge."); return; }
+
+            string dataDir = Path.Combine(Path.GetTempPath(), "FIEMGPlayBot_profile");
+            Process proc = LaunchEdge(edge, dataDir);
+            Log("Edge iniciado (PID " + proc.Id + "). Conectando via CDP...");
+
+            _cdp = new Cdp();
+            try
+            {
+                await _cdp.ConnectAsync(_cfg.EdgePort);
+                await _cdp.Send("Page.enable", null);
+                await _cdp.Send("Runtime.enable", null);
+                if (_cfg.BlockImages) { await _cdp.SetImagesEnabled(false); Log("Imagens bloqueadas (modo economia de memoria)."); }
+                Log("Conectado.");
+
+                await EnsureLoggedIn();
+                await FeedLoop();
+            }
+            finally
+            {
+                _cdp.Dispose();
+                try { if (!proc.HasExited) proc.Kill(); } catch { }
+                Log("Encerrado.");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Login (e-mail -> Entrar -> modal de senha -> OK)
+        // -----------------------------------------------------------------
+        static async Task EnsureLoggedIn()
+        {
+            await _cdp.Navigate(_cfg.LoginUrl);
+            await WaitDomReady(20000);
+            await Task.Delay(1500);
+            Dbg("DIAG inicial: " + await _cdp.EvalStr(JS_DIAG));
+
+            // Ja logado? (home autenticada presente)
+            if (await _cdp.EvalInt(JS_LOGGED_IN, 0) > 0)
+            { Log("Sessao reaproveitada (ja autenticado). Pontos: " + await GetPoints()); return; }
+
+            // Aceitar cookies (essenciais para login funcionar)
+            await ClickByTextIfPresent("Aceitar");
+            await Task.Delay(700);
+
+            // Garantir que o formulario de e-mail apareca: clicar "Entrar" da landing e aguardar (com retries)
+            for (int i = 0; i < 5 && await GetCenter(JS_EMAIL_CENTER) == null; i++)
+            {
+                await ClickByTextIfPresent("Entrar");
+                await Task.Delay(1800);
+            }
+
+            Dbg("DIAG pre-email: " + await _cdp.EvalStr(JS_DIAG));
+            Log("Autenticando: preenchendo e-mail...");
+            if (!await ClickCenter(JS_EMAIL_CENTER, 10000))
+                throw new Exception("Campo de e-mail nao encontrado. DIAG: " + await _cdp.EvalStr(JS_DIAG));
+            await _cdp.InsertText(_cfg.Email);
+            await Task.Delay(400);
+
+            // Botao "Entrar" do formulario (blur do campo dispara onChange do ZK)
+            if (!await ClickByText("Entrar", 8000))
+                throw new Exception("Botao Entrar nao encontrado.");
+
+            Log("Aguardando modal de senha...");
+            if (!await WaitUntil(async () => await GetCenter(JS_PWD_CENTER) != null, 12000, 400))
+                throw new Exception("Modal de senha nao apareceu. INPUTS: " + await _cdp.EvalStr(JS_INPUTS));
+
+            Log("Preenchendo senha...");
+            await ClickCenter(JS_PWD_CENTER, 3000);
+            await _cdp.InsertText(_cfg.Password);
+            await Task.Delay(500);
+            Dbg("DIAG pos-senha: " + await _cdp.EvalStr(JS_INPUTS));
+
+            bool okClicked = await ClickByText("OK", 6000);
+            Dbg("OK clicado=" + okClicked + ". Confirmando com Enter...");
+            await _cdp.PressEnter();
+            await Task.Delay(2500);
+            Dbg("DIAG pos-OK: " + await _cdp.EvalStr(JS_DIAG));
+
+            Log("Confirmando login...");
+            if (!await WaitUntil(async () => await _cdp.EvalInt(JS_LOGGED_IN, 0) > 0, 25000, 700))
+                throw new Exception("Login nao confirmado. DIAG: " + await _cdp.EvalStr(JS_DIAG));
+            Log("Login concluido. Pontos atuais: " + await GetPoints());
+        }
+
+        // -----------------------------------------------------------------
+        // Loop principal: coleta posts, curte os novos, rola, repete
+        // -----------------------------------------------------------------
+        static async Task FeedLoop()
+        {
+            await EnsureFeedLoaded();
+
+            string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
+            var done = LoadDone(donePath);
+            Log("IDs ja processados carregados: " + done.Count);
+
+            int totalLiked = 0;
+            int noMoreRounds = 0;
+            int noGain = 0;
+
+            while (true)
+            {
+                if (_cfg.MaxLikes > 0 && totalLiked >= _cfg.MaxLikes)
+                { Log("Limite de " + _cfg.MaxLikes + " avaliacoes atingido."); break; }
+
+                string idsCsv = await _cdp.EvalStr(JS_COLLECT_IDS);
+                var ids = (idsCsv ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                var novos = ids.Where(x => !done.Contains(x)).Distinct().ToList();
+
+                if (novos.Count > 0)
+                {
+                    noMoreRounds = 0;
+                    foreach (var id in novos)
+                    {
+                        if (_cfg.MaxLikes > 0 && totalLiked >= _cfg.MaxLikes) break;
+
+                        int before = await GetPoints();
+                        bool acted = await ReactToPost(id);
+                        done.Add(id);
+                        AppendDone(donePath, id);
+                        totalLiked++;
+                        int after = await GetPoints();
+                        string delta = (before >= 0 && after >= 0) ? (" (pontos " + before + " -> " + after + ")") : "";
+                        Log("[" + totalLiked + "] post " + id + (acted ? " avaliado" : " sem widget/pulado") + delta);
+
+                        // Deteccao de teto diario: se os pontos nao sobem, a plataforma nao esta creditando
+                        if (after > before) noGain = 0;
+                        else if (before >= 0 && after >= 0) noGain++;
+                        if (_cfg.StopAfterNoGain > 0 && noGain >= _cfg.StopAfterNoGain)
+                        {
+                            Log("AVISO: os pontos nao aumentaram em " + noGain + " avaliacoes seguidas.");
+                            Log("Provavel TETO DIARIO de pontos por curtidas atingido (a plataforma nao credita mais hoje). Encerrando.");
+                            return;
+                        }
+
+                        await Task.Delay(_rng.Next(_cfg.MinDelayMs, _cfg.MaxDelayMs + 1));
+
+                        if (_cfg.LongPauseEveryLikes > 0 && totalLiked % _cfg.LongPauseEveryLikes == 0)
+                        { Log("Pausa longa (" + (_cfg.LongPauseMs / 1000) + "s) para nao congestionar o servidor..."); await Task.Delay(_cfg.LongPauseMs); }
+
+                        if (_cfg.ReloadEveryLikes > 0 && totalLiked % _cfg.ReloadEveryLikes == 0)
+                        { Log("Recarregando pagina para liberar memoria..."); await ReloadFeed(); break; }
+                    }
+                    continue; // re-coleta: pode haver mais avaliaveis ja carregados
+                }
+
+                // Sem posts avaliaveis na tela -> clicar em 'Carregar mais' para paginar
+                bool grew = await TryLoadMore();
+                if (grew) { noMoreRounds = 0; continue; }
+
+                // Sem 'Carregar mais' e sem avaliaveis: provavelmente acabou. Confirma com 1 scroll.
+                noMoreRounds++;
+                Log("Nada para avaliar e sem 'Carregar mais' (" + noMoreRounds + "/2).");
+                if (noMoreRounds >= 2) break;
+                await ScrollDown();
+                await Task.Delay(_cfg.ScrollWaitMs);
+            }
+
+            Log("FIM. Total de posts avaliados nesta execucao: " + totalLiked + ". (feed esgotado ou limite atingido)");
+        }
+
+        // Reage a um post clicando no coracao escolhido (rating_options costuma estar visivel).
+        // Se estiver oculto, revela clicando no .beforeRated primeiro.
+        static async Task<bool> ReactToPost(string id)
+        {
+            // MaxHearts: passa um indice alto; o JS limita ao ultimo coracao (o de maior valor).
+            int idx = _cfg.MaxHearts ? 999 : _cfg.HeartIndex;
+            string heart = BuildJs(JS_HEART_CENTER, id, idx);
+            double[] c = await GetCenter(heart);
+            if (c == null)
+            {
+                var cb = await GetCenter(BuildJs(JS_BEFORE_CENTER, id, 0));
+                if (cb != null) { await _cdp.ClickAt(cb[0], cb[1]); await Task.Delay(500); }
+                await WaitUntil(async () => { c = await GetCenter(heart); return c != null; }, 2500, 300);
+            }
+            if (c != null) { await _cdp.ClickAt(c[0], c[1]); await Task.Delay(400); return true; }
+            return false; // post sem widget de reacao
+        }
+
+        static async Task ReloadFeed()
+        {
+            await _cdp.Navigate(_cfg.FeedUrl);
+            await WaitDomReady(20000);
+            // se a sessao caiu, refaz login
+            if (await GetCenter(JS_EMAIL_CENTER) != null) { Log("Sessao expirou; refazendo login."); await EnsureLoggedIn(); return; }
+            await WaitUntil(async () => await IsFeedReady(), 15000, 600);
+        }
+
+        static async Task ScrollDown()
+        {
+            await _cdp.Eval("window.scrollBy(0, Math.round(window.innerHeight*0.85)); 1");
+        }
+
+        // Clica em 'Carregar mais' (se existir) e espera novos posts. Retorna true se carregou mais.
+        static async Task<bool> TryLoadMore()
+        {
+            var c = await GetCenter(JS_CARREGAR_CENTER);
+            if (c == null) return false; // botao ausente => nao ha mais posts
+            int before = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+            Log("Clicando em 'Carregar mais'...");
+            await _cdp.ClickAt(c[0], c[1]);
+            bool grew = await WaitUntil(async () => await _cdp.EvalInt(JS_FEED_COUNT, 0) > before, 12000, 700);
+            int after = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+            Log("'Carregar mais': posts " + before + " -> " + after + (grew ? "" : " (sem novos)"));
+            await Task.Delay(800);
+            return grew;
+        }
+
+        // Garante que o feed tenha posts carregados (carga preguicosa: precisa de tempo + scroll suave)
+        static async Task EnsureFeedLoaded()
+        {
+            await _cdp.Send("Log.enable", null);
+
+            // 1) Espera na pagina atual (pos-login), sem re-navegar, com nudges suaves
+            if (await WaitForPosts(60000)) return;
+
+            // 2) Ultimo recurso: re-navega UMA vez
+            Log("Feed ainda vazio; renavegando ao feed uma vez...");
+            await _cdp.Navigate(_cfg.FeedUrl);
+            await WaitDomReady(20000);
+            if (await GetCenter(JS_EMAIL_CENTER) != null) { Log("Sessao caiu; refazendo login."); await EnsureLoggedIn(); }
+            if (await WaitForPosts(60000)) return;
+
+            Log("AVISO: feed vazio. DIAG: " + await _cdp.EvalStr(JS_FEED_DIAG));
+            Log("Erros JS capturados: " + (_cdp.Events.Count == 0 ? "(nenhum)" : string.Join(" || ", _cdp.Events.Take(8).ToArray())));
+        }
+
+        static async Task<bool> WaitForPosts(int timeoutMs)
+        {
+            int waited = 0, pollMs = 2000;
+            while (waited < timeoutMs)
+            {
+                int c = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+                if (c > 0) { Log("Feed carregado: " + c + " posts."); return true; }
+                await _cdp.Eval("window.scrollBy(0, 600); 1");
+                await Task.Delay(pollMs);
+                waited += pollMs;
+                if (waited % 10000 == 0) Dbg("  ...aguardando posts (" + (waited / 1000) + "s) DIAG: " + await _cdp.EvalStr(JS_FEED_DIAG));
+            }
+            return false;
+        }
+
+        // -----------------------------------------------------------------
+        // Helpers de pagina
+        // -----------------------------------------------------------------
+        static async Task<bool> IsFeedReady()
+        { return await _cdp.EvalInt(JS_FEED_COUNT, 0) > 0; }
+
+        static async Task<int> GetPoints()
+        { return await _cdp.EvalInt(JS_POINTS, -1); }
+
+        static async Task WaitDomReady(int timeoutMs)
+        { await WaitUntil(async () => (await _cdp.EvalStr("document.readyState")) == "complete", timeoutMs, 400); }
+
+        // Retorna [x,y] do centro do elemento, ou null.
+        static async Task<double[]> GetCenter(string js)
+        {
+            string s = await _cdp.EvalStr(js);
+            if (string.IsNullOrEmpty(s) || s.IndexOf(',') < 0) return null;
+            var parts = s.Split(',');
+            double x, y;
+            if (double.TryParse(parts[0], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out x)
+             && double.TryParse(parts[1], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out y))
+                return new double[] { x, y };
+            return null;
+        }
+
+        static async Task<bool> ClickCenter(string js, int timeoutMs)
+        {
+            double[] c = null;
+            bool ok = await WaitUntil(async () => { c = await GetCenter(js); return c != null; }, timeoutMs, 300);
+            if (ok && c != null) { await _cdp.ClickAt(c[0], c[1]); return true; }
+            return false;
+        }
+
+        static async Task<bool> ClickByText(string text, int timeoutMs)
+        { return await ClickCenter(BuildText(JS_TEXT_CENTER, text), timeoutMs); }
+
+        static async Task ClickByTextIfPresent(string text)
+        {
+            var c = await GetCenter(BuildText(JS_TEXT_CENTER, text));
+            if (c != null) await _cdp.ClickAt(c[0], c[1]);
+        }
+
+        static async Task<bool> WaitUntil(Func<Task<bool>> cond, int timeoutMs, int pollMs)
+        {
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                try { if (await cond()) return true; } catch { }
+                await Task.Delay(pollMs);
+                waited += pollMs;
+            }
+            try { return await cond(); } catch { return false; }
+        }
+
+        // -----------------------------------------------------------------
+        // Persistencia de IDs ja processados
+        // -----------------------------------------------------------------
+        static HashSet<string> LoadDone(string path)
+        {
+            var set = new HashSet<string>();
+            if (File.Exists(path))
+                foreach (var line in File.ReadAllLines(path))
+                { var t = line.Trim(); if (t.Length > 0) set.Add(t); }
+            return set;
+        }
+
+        static void AppendDone(string path, string id)
+        { try { File.AppendAllText(path, id + Environment.NewLine); } catch { } }
+
+        // -----------------------------------------------------------------
+        // Edge
+        // -----------------------------------------------------------------
+        static string FindEdge()
+        {
+            string[] cands = new string[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Microsoft\Edge\Application\msedge.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Microsoft\Edge\Application\msedge.exe")
+            };
+            foreach (var c in cands) if (File.Exists(c)) return c;
+            return null;
+        }
+
+        static Process LaunchEdge(string edge, string dataDir)
+        {
+            var sb = new StringBuilder();
+            if (_cfg.Headless) sb.Append("--headless=new ");
+            sb.Append("--remote-debugging-port=" + _cfg.EdgePort + " ");
+            sb.Append("--remote-allow-origins=* ");           // necessario em Chromium recente p/ aceitar o WebSocket
+            sb.Append("--user-data-dir=\"" + dataDir + "\" "); // persiste sessao/cookies entre execucoes
+            sb.Append("--no-first-run --no-default-browser-check --disable-extensions ");
+            sb.Append("--window-size=1280,2000 ");
+            sb.Append("about:blank");
+
+            var psi = new ProcessStartInfo(edge, sb.ToString());
+            psi.UseShellExecute = false;
+            return Process.Start(psi);
+        }
+
+        static void Log(string m)
+        { Console.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + m); }
+
+        static void Dbg(string m)
+        { if (_cfg != null && _cfg.Verbose) Log(m); }
+
+        // -----------------------------------------------------------------
+        // Templates de JavaScript (injetados via Runtime.evaluate)
+        // -----------------------------------------------------------------
+        static string BuildJs(string tpl, string id, int idx)
+        { return tpl.Replace("__ID__", id).Replace("__IDX__", idx.ToString()); }
+        static string BuildText(string tpl, string text)
+        { return tpl.Replace("__TXT__", text.Replace("'", "\\'")); }
+
+        // Diagnostico de pagina
+        const string JS_DIAG = @"
+(function(){
+  var inputs=document.querySelectorAll('input'); var vis=0;
+  for(var i=0;i<inputs.length;i++) if(inputs[i].offsetParent!==null) vis++;
+  var bt=(document.body?document.body.innerText:'').replace(/\s+/g,' ').slice(0,200);
+  return 'url='+location.href+' | title='+document.title+' | inputs='+inputs.length+' vis='+vis+' | body=['+bt+']';
+})()";
+
+        // Detecta home autenticada (tem 'Sair' e 'pontos')
+        const string JS_LOGGED_IN = @"
+(function(){ var t=(document.body?document.body.innerText:''); return (/Sair/.test(t) && /pontos/i.test(t)) ? 1 : 0; })()";
+
+        // Conta posts/widgets de reacao carregados (rating_options eh o seletor confiavel)
+        const string JS_FEED_COUNT = @"document.querySelectorAll('.rating_options').length";
+
+        // Diagnostico do feed
+        const string JS_FEED_DIAG = @"
+(function(){
+  var a=document.querySelectorAll('.social').length;
+  var b=document.querySelectorAll('.rating_options').length;
+  var c=document.querySelectorAll('.beforeRated').length;
+  var feedTxt='';
+  var els=document.querySelectorAll('*');
+  for(var i=0;i<els.length;i++){
+    if(els[i].children.length===0 && /Acompanhe as atividades/.test(els[i].textContent)){
+      var p=els[i]; for(var k=0;k<6&&p;k++)p=p.parentElement;
+      if(p) feedTxt=(p.innerText||'').replace(/\s+/g,' ').slice(0,180);
+      break;
+    }
+  }
+  return 'social='+a+' rating_options='+b+' beforeRated='+c+' feed=['+feedTxt+']';
+})()";
+
+        // CSV dos IDs ACIONAVEIS (posts NAO avaliados).
+        // Sinais (robusto p/ layouts largo e estreito): o wrapper tem classe 'post_rating'
+        // (vs 'post_rated' = ja avaliado) OU o coracao .beforeRated esta visivel.
+        // O ID vem do token numerico de .rating_options (ex.: 'rating_options 2827971').
+        const string JS_COLLECT_IDS = @"
+(function(){
+  var opts=document.querySelectorAll('.rating_options'); var ids=[];
+  for(var i=0;i<opts.length;i++){
+    var o=opts[i]; var cls=(o.className||'').split(/\s+/); var id=null;
+    for(var j=0;j<cls.length;j++){ if(/^\d+$/.test(cls[j])){ id=cls[j]; break; } }
+    if(!id) continue;
+    var unrated=false;
+    var wrap=o.parentElement?o.parentElement.parentElement:null;
+    if(wrap && (' '+(wrap.className||'')+' ').indexOf(' post_rating ')>=0) unrated=true;
+    var before=o.parentElement?o.parentElement.querySelector('.beforeRated'):null;
+    if(before && getComputedStyle(before).display!=='none') unrated=true;
+    if(unrated) ids.push(id);
+  }
+  return ids.join(',');
+})()";
+
+        // Centro do botao 'Carregar mais'. NA PRATICA e um ICONE de seta-circulo
+        // (i.fa-chevron-circle-down), as vezes sem o texto. So existe quando ha mais posts.
+        const string JS_CARREGAR_CENTER = @"
+(function(){
+  // 1) icone de seta para baixo (o botao real de carregar mais)
+  var icon=document.querySelector('i.fa-chevron-circle-down, i.fa-arrow-circle-down, i.fa-angle-double-down, i.fa-chevron-down, i.fa-angle-down');
+  if(icon && icon.offsetParent!==null){
+    icon.scrollIntoView({block:'center'});
+    var r=icon.getBoundingClientRect();
+    if(r.width>0) return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+  }
+  // 2) fallback: elemento com texto 'Carregar mais'
+  var els=document.querySelectorAll('a,button,div,span,li');
+  for(var i=0;i<els.length;i++){
+    var e=els[i]; if(e.offsetParent===null) continue;
+    var t=(e.textContent||'').trim();
+    if(t.indexOf('Carregar mais')===0 && t.length<25 && e.children.length<=3){
+      e.scrollIntoView({block:'center'});
+      var r2=e.getBoundingClientRect(); if(r2.width>0) return Math.round(r2.left+r2.width/2)+','+Math.round(r2.top+r2.height/2);
+    }
+  }
+  return null;
+})()";
+
+        // Centro do .beforeRated do post __ID__ (fallback p/ revelar os coracoes; null se oculto/ausente)
+        const string JS_BEFORE_CENTER = @"
+(function(){
+  var opts=document.querySelectorAll('.rating_options');
+  for(var i=0;i<opts.length;i++){
+    if((opts[i].className||'').split(/\s+/).indexOf('__ID__')>=0){
+      var b=opts[i].parentElement.querySelector('.beforeRated'); if(!b) return null;
+      if(getComputedStyle(b).display==='none') return null;
+      b.scrollIntoView({block:'center'});
+      var r=b.getBoundingClientRect();
+      if(r.width<=0||r.height<=0) return null;
+      return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+    }
+  }
+  return null;
+})()";
+
+        // Centro do coracao __IDX__ (1..5; 5='Amei') do post __ID__, se rating_options visivel
+        const string JS_HEART_CENTER = @"
+(function(){
+  var opts=document.querySelectorAll('.rating_options');
+  for(var i=0;i<opts.length;i++){
+    if((opts[i].className||'').split(/\s+/).indexOf('__ID__')>=0){
+      var o=opts[i];
+      if(getComputedStyle(o).display==='none') return null;
+      var hs=o.querySelectorAll('img'); if(hs.length===0) return null;
+      var idx=__IDX__; if(idx<1)idx=1; if(idx>hs.length)idx=hs.length;
+      var h=hs[idx-1]; h.scrollIntoView({block:'center'});
+      var r=h.getBoundingClientRect(); if(r.width<=0) return null;
+      return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+    }
+  }
+  return null;
+})()";
+
+        // Pontos do cabecalho (numero formatado tipo 186.910, perto da palavra 'pontos')
+        const string JS_POINTS = @"
+(function(){
+  var all=document.querySelectorAll('*');
+  for(var i=0;i<all.length;i++){
+    var e=all[i];
+    if(e.children.length===0){
+      var t=(e.textContent||'').trim();
+      if(/^\d{1,3}(\.\d{3})+$/.test(t)){
+        var ctx=''; var p=e; for(var k=0;k<4&&p;k++){ ctx+=' '+(p.textContent||''); p=p.parentElement; }
+        if(/pontos|ponto/i.test(ctx)) return parseInt(t.replace(/\./g,''),10);
+      }
+    }
+  }
+  return -1;
+})()";
+
+        // Centro do campo de e-mail (input cujo rotulo proximo contem E-MAIL)
+        const string JS_EMAIL_CENTER = @"
+(function(){
+  var ins=document.querySelectorAll('input');
+  for(var i=0;i<ins.length;i++){
+    var el=ins[i]; if(el.offsetParent===null) continue;
+    var t='',p=el; for(var j=0;j<4&&p;j++){ t+=' '+(p.textContent||''); p=p.parentElement; }
+    if(t.toUpperCase().indexOf('E-MAIL')>=0){
+      el.scrollIntoView({block:'center'}); var r=el.getBoundingClientRect();
+      if(r.width<=0) return null;
+      return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+    }
+  }
+  return null;
+})()";
+
+        // Centro do campo de senha (ESTRITO: type=password ou placeholder contem SENHA)
+        const string JS_PWD_CENTER = @"
+(function(){
+  var ins=document.querySelectorAll('input');
+  for(var i=0;i<ins.length;i++){
+    var el=ins[i]; if(el.offsetParent===null) continue;
+    var ph=(el.getAttribute('placeholder')||'').toUpperCase();
+    if(el.type==='password' || ph.indexOf('SENHA')>=0){
+      el.scrollIntoView({block:'center'}); var r=el.getBoundingClientRect();
+      if(r.width>0) return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+    }
+  }
+  return null;
+})()";
+
+        // Lista atributos dos inputs (diagnostico)
+        const string JS_INPUTS = @"
+(function(){
+  var ins=document.querySelectorAll('input'); var out=[];
+  for(var i=0;i<ins.length;i++){var el=ins[i];
+    out.push('{type='+el.type+',ph='+(el.getAttribute('placeholder')||'')+',vis='+(el.offsetParent!==null)+'}');}
+  return out.join(' ');
+})()";
+
+        // Centro de um elemento clicavel cujo texto/valor == __TXT__
+        const string JS_TEXT_CENTER = @"
+(function(){
+  var els=document.querySelectorAll('a,button,div,span,input,li');
+  for(var i=0;i<els.length;i++){
+    var e=els[i]; if(e.offsetParent===null) continue;
+    var et=(e.tagName==='INPUT')?(e.value||''):(e.textContent||'');
+    if(e.children.length<=2 && et.trim()==='__TXT__'){
+      e.scrollIntoView({block:'center'}); var r=e.getBoundingClientRect();
+      if(r.width>0&&r.height>0) return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+    }
+  }
+  return null;
+})()";
+    }
+}

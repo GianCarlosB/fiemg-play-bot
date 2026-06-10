@@ -1,0 +1,24 @@
+{
+  "loginUrl": "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true",
+  "feedUrl": "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true",
+  "email": "seu-email@exemplo.com",
+  "password": "SUA_SENHA_AQUI",
+
+  "edgePort": 9222,
+  "headless": true,
+  "blockImages": false,
+  "verbose": true,
+
+  "minDelayMs": 2500,
+  "maxDelayMs": 6000,
+  "longPauseEveryLikes": 30,
+  "longPauseMs": 60000,
+  "reloadEveryLikes": 0,
+  "maxLikes": 0,
+  "maxEmptyScrollRounds": 4,
+  "scrollWaitMs": 2500,
+  "maxHearts": true,
+  "heartIndex": 5,
+  "stopAfterNoGain": 10,
+  "doneFile": "done.txt"
+}

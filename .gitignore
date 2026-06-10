@@ -1,0 +1,9 @@
+# Credenciais reais - NUNCA versionar (use config.example.json como modelo)
+config.json
+
+# Artefato de build (regerado pelo run.bat / csc)
+FIEMGPlayBot.exe
+
+# Arquivos de runtime
+done.txt
+*.log
