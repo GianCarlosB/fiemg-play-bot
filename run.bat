@@ -13,7 +13,7 @@ if not exist "%CSC%" (
 
 echo Compilando FIEMGPlayBot.exe ...
 "%CSC%" /nologo /noconfig /optimize+ /target:exe /out:FIEMGPlayBot.exe ^
-  /r:mscorlib.dll /r:System.dll /r:System.Core.dll /r:System.Net.Http.dll /r:System.Web.Extensions.dll ^
+  /r:mscorlib.dll /r:System.dll /r:System.Core.dll /r:System.Net.Http.dll /r:System.Web.Extensions.dll /r:System.Management.dll ^
   FIEMGPlayBot.cs
 
 if errorlevel 1 (
@@ -25,6 +25,5 @@ if errorlevel 1 (
 
 echo Compilado com sucesso. Executando...
 echo.
+rem O proprio FIEMGPlayBot.exe aguarda o ENTER do usuario ao final antes de fechar a janela.
 FIEMGPlayBot.exe
-echo.
-pause

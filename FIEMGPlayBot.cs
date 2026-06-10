@@ -15,6 +15,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Management;          // WMI: localizar Edge orfao pela linha de comando (in-box do Windows)
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
@@ -31,6 +32,7 @@ namespace FIEMGPlayBot
     {
         public string LoginUrl = "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true";
         public string FeedUrl = "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true";
+        public string FeedTab = "Social";   // aba a abrir antes de coletar posts ("Social" carrega mais que "Inicio"). Vazio = aba atual.
         public string Email = "";
         public string Password = "";
         public int EdgePort = 9222;
@@ -42,13 +44,12 @@ namespace FIEMGPlayBot
         public int LongPauseMs = 60000;
         public int ReloadEveryLikes = 40;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria)
         public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
-        public int MaxEmptyScrollRounds = 4; // rodadas seguidas sem posts novos => fim do feed
+        public int MaxEmptyScrollRounds = 0; // tentativas vazias seguidas antes de encerrar; 0 = nunca desiste sozinho (so para por interrupcao do usuario ou erro critico)
         public int ScrollWaitMs = 2500;
         public bool MaxHearts = true;        // SEMPRE clicar no coracao de maior valor (ultimo = "Amei"), robusto a qualquer quantidade
         public int HeartIndex = 5;           // usado apenas quando MaxHearts=false. 1..5 (5="Amei")
         public string DoneFile = "done.txt";
         public bool Verbose = false;         // logs de diagnostico detalhados (login/feed)
-        public int StopAfterNoGain = 10;     // se os pontos nao subirem em N avaliacoes seguidas, para (provavel teto diario). 0 = desliga
 
         public static Config Load(string path)
         {
@@ -59,6 +60,7 @@ namespace FIEMGPlayBot
             if (d == null) return c;
             c.LoginUrl = Str(d, "loginUrl", c.LoginUrl);
             c.FeedUrl = Str(d, "feedUrl", c.FeedUrl);
+            c.FeedTab = Str(d, "feedTab", c.FeedTab);
             c.Email = Str(d, "email", c.Email);
             c.Password = Str(d, "password", c.Password);
             c.EdgePort = Int(d, "edgePort", c.EdgePort);
@@ -76,7 +78,6 @@ namespace FIEMGPlayBot
             c.HeartIndex = Int(d, "heartIndex", c.HeartIndex);
             c.DoneFile = Str(d, "doneFile", c.DoneFile);
             c.Verbose = Bool(d, "verbose", c.Verbose);
-            c.StopAfterNoGain = Int(d, "stopAfterNoGain", c.StopAfterNoGain);
             return c;
         }
 
@@ -291,6 +292,19 @@ namespace FIEMGPlayBot
         {
             try { MainAsync().GetAwaiter().GetResult(); }
             catch (Exception ex) { Log("ERRO FATAL: " + ex.Message); }
+            finally { WaitForUserToClose(); }
+        }
+
+        // Mantem a janela aberta ao final (sucesso OU erro) ate o usuario confirmar — assim,
+        // ao rodar com duplo-clique no .exe a janela nao fecha sozinha levando embora os logs.
+        // Se a saida estiver redirecionada (sem console interativo), ReadLine retorna sem
+        // bloquear, entao nao trava execucoes automatizadas.
+        static void WaitForUserToClose()
+        {
+            Console.WriteLine();
+            Console.WriteLine("Execucao finalizada. Pressione ENTER para fechar a janela...");
+            try { Console.ReadLine(); }
+            catch { /* stdin indisponivel: nao bloqueia */ }
         }
 
         static async Task MainAsync()
@@ -313,6 +327,7 @@ namespace FIEMGPlayBot
             if (edge == null) { Log("msedge.exe nao encontrado. Instale o Microsoft Edge."); return; }
 
             string dataDir = Path.Combine(Path.GetTempPath(), "FIEMGPlayBot_profile");
+            KillStaleEdge(dataDir); // evita travar em "Conectando via CDP..." por Edge orfao de execucao anterior
             Process proc = LaunchEdge(edge, dataDir);
             Log("Edge iniciado (PID " + proc.Id + "). Conectando via CDP...");
 
@@ -406,8 +421,8 @@ namespace FIEMGPlayBot
             Log("IDs ja processados carregados: " + done.Count);
 
             int totalLiked = 0;
-            int noMoreRounds = 0;
-            int noGain = 0;
+            int emptyRounds = 0;
+            int lastPoints = await GetPoints(); // ponto de partida p/ mostrar o delta por curtida
 
             while (true)
             {
@@ -420,31 +435,30 @@ namespace FIEMGPlayBot
 
                 if (novos.Count > 0)
                 {
-                    noMoreRounds = 0;
+                    emptyRounds = 0;
                     foreach (var id in novos)
                     {
                         if (_cfg.MaxLikes > 0 && totalLiked >= _cfg.MaxLikes) break;
 
-                        int before = await GetPoints();
                         bool acted = await ReactToPost(id);
-                        done.Add(id);
-                        AppendDone(donePath, id);
+                        done.Add(id);   // dedup em MEMORIA sempre: evita reprocessar/loopar o mesmo post nesta execucao
                         totalLiked++;
-                        int after = await GetPoints();
-                        string delta = (before >= 0 && after >= 0) ? (" (pontos " + before + " -> " + after + ")") : "";
-                        Log("[" + totalLiked + "] post " + id + (acted ? " avaliado" : " sem widget/pulado") + delta);
 
-                        // Deteccao de teto diario: se os pontos nao sobem, a plataforma nao esta creditando
-                        if (after > before) noGain = 0;
-                        else if (before >= 0 && after >= 0) noGain++;
-                        if (_cfg.StopAfterNoGain > 0 && noGain >= _cfg.StopAfterNoGain)
-                        {
-                            Log("AVISO: os pontos nao aumentaram em " + noGain + " avaliacoes seguidas.");
-                            Log("Provavel TETO DIARIO de pontos por curtidas atingido (a plataforma nao credita mais hoje). Encerrando.");
-                            return;
-                        }
-
+                        // Espaco anti-bloqueio (tambem da tempo do servidor creditar os pontos antes da leitura).
                         await Task.Delay(_rng.Next(_cfg.MinDelayMs, _cfg.MaxDelayMs + 1));
+
+                        // So grava em done.txt a curtida que REALMENTE rendeu pontos. Sem ganho = post ja
+                        // contabilizado antes (a plataforma nao regrava a curtida): fica FORA do done.txt
+                        // para ser tentado de novo numa execucao futura.
+                        int after = await GetPoints();
+                        bool gained = (lastPoints >= 0 && after >= 0 && after > lastPoints);
+                        if (gained) AppendDone(donePath, id);
+                        string delta = (lastPoints >= 0 && after >= 0)
+                            ? (gained ? (" (+" + (after - lastPoints) + " pts -> " + after + "; gravado em done.txt)")
+                                      : " (sem ganho: ja contabilizado; NAO gravado em done.txt)")
+                            : "";
+                        if (after >= 0) lastPoints = after;
+                        Log("[" + totalLiked + "] post " + id + (acted ? " avaliado" : " sem widget/pulado") + delta);
 
                         if (_cfg.LongPauseEveryLikes > 0 && totalLiked % _cfg.LongPauseEveryLikes == 0)
                         { Log("Pausa longa (" + (_cfg.LongPauseMs / 1000) + "s) para nao congestionar o servidor..."); await Task.Delay(_cfg.LongPauseMs); }
@@ -455,19 +469,24 @@ namespace FIEMGPlayBot
                     continue; // re-coleta: pode haver mais avaliaveis ja carregados
                 }
 
-                // Sem posts avaliaveis na tela -> clicar em 'Carregar mais' para paginar
+                // Sem posts avaliaveis na tela -> carrega posts MAIS ANTIGOS via 'Carregar mais'
                 bool grew = await TryLoadMore();
-                if (grew) { noMoreRounds = 0; continue; }
+                if (grew) { emptyRounds = 0; continue; }
 
-                // Sem 'Carregar mais' e sem avaliaveis: provavelmente acabou. Confirma com 1 scroll.
-                noMoreRounds++;
-                Log("Nada para avaliar e sem 'Carregar mais' (" + noMoreRounds + "/2).");
-                if (noMoreRounds >= 2) break;
+                // 'Carregar mais' nao cresceu agora. O bot NAO encerra por isso: ele continua
+                // buscando posts mais antigos (o botao costuma reaparecer). So para por interrupcao
+                // do usuario (fechar a janela / Ctrl+C) ou erro critico. 'maxEmptyScrollRounds' define
+                // um limite OPCIONAL de tentativas vazias seguidas; 0 (padrao) = nunca desiste sozinho.
+                emptyRounds++;
+                if (_cfg.MaxEmptyScrollRounds > 0 && emptyRounds >= _cfg.MaxEmptyScrollRounds)
+                { Log("Sem novos posts apos " + emptyRounds + " tentativas (maxEmptyScrollRounds). Encerrando."); break; }
+                if (emptyRounds == 1 || emptyRounds % 10 == 0)
+                    Log("Sem novos posts no momento (tentativa " + emptyRounds + "); rolando e seguindo a busca por posts mais antigos...");
                 await ScrollDown();
                 await Task.Delay(_cfg.ScrollWaitMs);
             }
 
-            Log("FIM. Total de posts avaliados nesta execucao: " + totalLiked + ". (feed esgotado ou limite atingido)");
+            Log("FIM. Total de posts avaliados nesta execucao: " + totalLiked + ".");
         }
 
         // Reage a um post clicando no coracao escolhido (rating_options costuma estar visivel).
@@ -493,7 +512,9 @@ namespace FIEMGPlayBot
             await _cdp.Navigate(_cfg.FeedUrl);
             await WaitDomReady(20000);
             // se a sessao caiu, refaz login
-            if (await GetCenter(JS_EMAIL_CENTER) != null) { Log("Sessao expirou; refazendo login."); await EnsureLoggedIn(); return; }
+            if (await GetCenter(JS_EMAIL_CENTER) != null) { Log("Sessao expirou; refazendo login."); await EnsureLoggedIn(); }
+            // a renavegacao volta para 'Inicio' -> reabrir a aba configurada (Social) antes de continuar
+            await GoToFeedTab();
             await WaitUntil(async () => await IsFeedReady(), 15000, 600);
         }
 
@@ -517,10 +538,30 @@ namespace FIEMGPlayBot
             return grew;
         }
 
+        // Abre a aba de feed configurada (ex.: "Social", que carrega MAIS posts que "Inicio").
+        // A aba e um <a onclick="selectMenuItem('li_friends')"> com href="#friends": um handler
+        // INLINE comum (nao um widget ZK), entao invocar .click() via JS dispara o onclick de
+        // forma confiavel. Vantagem sobre clique por coordenada: NAO depende de layout/visibilidade,
+        // que era a causa da falha (a navbar ainda estava em 'Atualizando...' durante a carga inicial).
+        static async Task GoToFeedTab()
+        {
+            if (string.IsNullOrEmpty(_cfg.FeedTab)) return; // vazio = usar a aba atual (padrao 'Inicio')
+            Log("Abrindo a aba '" + _cfg.FeedTab + "' (carrega mais posts que 'Inicio')...");
+            // WaitUntil cobre o estado 'Atualizando...' do ZK: tenta ate o <a> da aba existir no DOM.
+            bool clicked = await WaitUntil(async () =>
+                (await _cdp.EvalStr(BuildText(JS_CLICK_TAB, _cfg.FeedTab))) == "ok", 45000, 700);
+            if (clicked) { await Task.Delay(2500); Log("Aba '" + _cfg.FeedTab + "' aberta."); } // espera o feed da aba renderizar
+            else Log("AVISO: aba '" + _cfg.FeedTab + "' nao encontrada; seguindo no feed atual.");
+        }
+
         // Garante que o feed tenha posts carregados (carga preguicosa: precisa de tempo + scroll suave)
         static async Task EnsureFeedLoaded()
         {
             await _cdp.Send("Log.enable", null);
+
+            // 0) Troca para a aba de feed configurada (Social) ANTES de esperar posts:
+            //    'Inicio' tambem tem .rating_options, entao a troca precisa vir primeiro.
+            await GoToFeedTab();
 
             // 1) Espera na pagina atual (pos-login), sem re-navegar, com nudges suaves
             if (await WaitForPosts(60000)) return;
@@ -530,6 +571,7 @@ namespace FIEMGPlayBot
             await _cdp.Navigate(_cfg.FeedUrl);
             await WaitDomReady(20000);
             if (await GetCenter(JS_EMAIL_CENTER) != null) { Log("Sessao caiu; refazendo login."); await EnsureLoggedIn(); }
+            await GoToFeedTab();
             if (await WaitForPosts(60000)) return;
 
             Log("AVISO: feed vazio. DIAG: " + await _cdp.EvalStr(JS_FEED_DIAG));
@@ -634,6 +676,36 @@ namespace FIEMGPlayBot
             return null;
         }
 
+        // Encerra instancias do Edge deixadas por execucoes anteriores que ainda seguram ESTE
+        // perfil/porta. Sem isso, o novo msedge.exe so encaminha para a instancia velha e sai,
+        // sem abrir a porta de debug -> o bot trava em "Conectando via CDP...". Filtra pela
+        // linha de comando (caminho do perfil dedicado), entao NUNCA mata um Edge pessoal.
+        static void KillStaleEdge(string dataDir)
+        {
+            int killed = 0;
+            try
+            {
+                using (var searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'msedge.exe'"))
+                using (var results = searcher.Get())
+                {
+                    foreach (ManagementObject mo in results)
+                    {
+                        string cmd = Convert.ToString(mo["CommandLine"]) ?? "";
+                        if (cmd.IndexOf(dataDir, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        try { Process.GetProcessById(Convert.ToInt32(mo["ProcessId"])).Kill(); killed++; } catch { }
+                    }
+                }
+            }
+            catch { /* WMI indisponivel: segue sem matar (o LaunchEdge ainda tenta) */ }
+
+            // Remove locks de singleton do perfil para garantir um arranque limpo
+            try { foreach (var f in Directory.GetFiles(dataDir, "Singleton*")) { try { File.Delete(f); } catch { } } }
+            catch { /* perfil ainda nao existe (primeira execucao) */ }
+
+            if (killed > 0) { Log("Limpeza: " + killed + " processo(s) Edge orfao(s) do bot encerrado(s)."); Thread.Sleep(700); }
+        }
+
         static Process LaunchEdge(string edge, string dataDir)
         {
             var sb = new StringBuilder();
@@ -721,19 +793,36 @@ namespace FIEMGPlayBot
 
         // Centro do botao 'Carregar mais'. NA PRATICA e um ICONE de seta-circulo
         // (i.fa-chevron-circle-down), as vezes sem o texto. So existe quando ha mais posts.
+        //
+        // CUIDADO (descoberto na aba Social): a pagina tem VARIOS desses icones — um por
+        // secao de aba (Inicio/Social compartilham 'id=newsfeed' duplicado) e ate um na
+        // secao 'Atividades'. Os de abas inativas ficam OCULTOS (offsetParent===null).
+        // querySelector pegava o PRIMEIRO do DOM (um oculto) e desistia -> o bot achava que
+        // o feed acabou. Aqui: varremos TODOS, ficamos com os VISIVEIS e priorizamos o que
+        // esta dentro do feed de posts (#newsfeed), pegando o mais ao fim da pagina.
         const string JS_CARREGAR_CENTER = @"
 (function(){
   // 1) icone de seta para baixo (o botao real de carregar mais)
-  var icon=document.querySelector('i.fa-chevron-circle-down, i.fa-arrow-circle-down, i.fa-angle-double-down, i.fa-chevron-down, i.fa-angle-down');
-  if(icon && icon.offsetParent!==null){
-    icon.scrollIntoView({block:'center'});
-    var r=icon.getBoundingClientRect();
-    if(r.width>0) return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+  var icons=document.querySelectorAll('i.fa-chevron-circle-down, i.fa-arrow-circle-down, i.fa-angle-double-down, i.fa-chevron-down, i.fa-angle-down');
+  var vis=[];
+  for(var i=0;i<icons.length;i++){
+    var ic=icons[i]; if(ic.offsetParent===null) continue;           // ignora os de abas/secoes ocultas
+    var r=ic.getBoundingClientRect(); if(r.width<=0||r.height<=0) continue;
+    var inFeed=0, p=ic;
+    for(var k=0;k<8&&p;k++){ if(p.id && p.id.toLowerCase().indexOf('newsfeed')>=0){ inFeed=1; break; } p=p.parentElement; }
+    vis.push({ic:ic, inFeed:inFeed, top:r.top});
+  }
+  if(vis.length){
+    // prioriza o do #newsfeed; entre varios, o mais abaixo (fim do feed carregado)
+    vis.sort(function(a,b){ if(a.inFeed!==b.inFeed) return b.inFeed-a.inFeed; return b.top-a.top; });
+    var best=vis[0].ic; best.scrollIntoView({block:'center'});
+    var rr=best.getBoundingClientRect();
+    if(rr.width>0) return Math.round(rr.left+rr.width/2)+','+Math.round(rr.top+rr.height/2);
   }
   // 2) fallback: elemento com texto 'Carregar mais'
   var els=document.querySelectorAll('a,button,div,span,li');
-  for(var i=0;i<els.length;i++){
-    var e=els[i]; if(e.offsetParent===null) continue;
+  for(var j=0;j<els.length;j++){
+    var e=els[j]; if(e.offsetParent===null) continue;
     var t=(e.textContent||'').trim();
     if(t.indexOf('Carregar mais')===0 && t.length<25 && e.children.length<=3){
       e.scrollIntoView({block:'center'});
@@ -833,6 +922,22 @@ namespace FIEMGPlayBot
   for(var i=0;i<ins.length;i++){var el=ins[i];
     out.push('{type='+el.type+',ph='+(el.getAttribute('placeholder')||'')+',vis='+(el.offsetParent!==null)+'}');}
   return out.join(' ');
+})()";
+
+        // Clica na ABA de navegacao cujo texto == __TXT__ (ex.: 'Social'), via seu onclick
+        // inline 'selectMenuItem(...)'. Retorna 'ok' se achou e clicou, senao 'notfound'.
+        // Restringe aos <a> de navegacao (onclick com selectMenuItem) para nunca clicar por
+        // engano em outro 'Social' do corpo da pagina. Robusto a timing: so exige o <a> no DOM.
+        const string JS_CLICK_TAB = @"
+(function(){
+  var name='__TXT__';
+  var links=document.querySelectorAll('a[onclick]');
+  for(var i=0;i<links.length;i++){
+    var a=links[i];
+    if((a.getAttribute('onclick')||'').indexOf('selectMenuItem')<0) continue;
+    if((a.textContent||'').trim()===name){ a.click(); return 'ok'; }
+  }
+  return 'notfound';
 })()";
 
         // Centro de um elemento clicavel cujo texto/valor == __TXT__

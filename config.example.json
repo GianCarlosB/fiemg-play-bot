@@ -1,6 +1,7 @@
 {
   "loginUrl": "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true",
   "feedUrl": "https://www.cluube.com/interactivity.do?a=fiemgplay&desktop=true",
+  "feedTab": "Social",
   "email": "seu-email@exemplo.com",
   "password": "SUA_SENHA_AQUI",
 
@@ -15,10 +16,9 @@
   "longPauseMs": 60000,
   "reloadEveryLikes": 0,
   "maxLikes": 0,
-  "maxEmptyScrollRounds": 4,
+  "maxEmptyScrollRounds": 0,
   "scrollWaitMs": 2500,
   "maxHearts": true,
   "heartIndex": 5,
-  "stopAfterNoGain": 10,
   "doneFile": "done.txt"
 }
