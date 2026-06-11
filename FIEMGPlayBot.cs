@@ -38,7 +38,7 @@ namespace FIEMGPlayBot
         public int EdgePort = 9222;
         public int CdpTimeoutMs = 30000;     // timeout por chamada CDP; se a pagina parar de responder, lanca erro em vez de travar
         public bool Headless = true;
-        public bool BlockImages = false;     // desligar imagens economiza RAM, mas pode quebrar o clique nos coracoes
+        public bool BlockImages = true;      // bloquear imagens deixa o feed leve (menos RAM/travadas). Seguro: a reacao usa rateClick(.click()), nao depende da imagem renderizada
         public int MinDelayMs = 2500;
         public int MaxDelayMs = 6000;
         public int LongPauseEveryLikes = 30;
@@ -50,6 +50,7 @@ namespace FIEMGPlayBot
         public bool MaxHearts = true;        // SEMPRE clicar no coracao de maior valor (ultimo = "Amei"), robusto a qualquer quantidade
         public int HeartIndex = 5;           // usado apenas quando MaxHearts=false. 1..5 (5="Amei")
         public string DoneFile = "done.txt";
+        public string LastFile = "last.txt"; // grava (sobrescrevendo) o ID do ULTIMO post analisado, com ou sem ganho
         public bool Verbose = false;         // logs de diagnostico detalhados (login/feed)
 
         public static Config Load(string path)
@@ -79,6 +80,7 @@ namespace FIEMGPlayBot
             c.MaxHearts = Bool(d, "maxHearts", c.MaxHearts);
             c.HeartIndex = Int(d, "heartIndex", c.HeartIndex);
             c.DoneFile = Str(d, "doneFile", c.DoneFile);
+            c.LastFile = Str(d, "lastFile", c.LastFile);
             c.Verbose = Bool(d, "verbose", c.Verbose);
             return c;
         }
@@ -435,6 +437,7 @@ namespace FIEMGPlayBot
             await EnsureFeedLoaded();
 
             string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
+            string lastPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.LastFile);
             var done = LoadDone(donePath);
             Log("IDs ja processados carregados: " + done.Count);
 
@@ -460,6 +463,7 @@ namespace FIEMGPlayBot
 
                         bool acted = await ReactToPost(id);
                         done.Add(id);   // dedup em MEMORIA sempre: evita reprocessar/loopar o mesmo post nesta execucao
+                        WriteLast(lastPath, id);  // ULTIMO post analisado (sobrescreve sempre, com ou sem ganho)
                         totalLiked++;
 
                         // Espaco anti-bloqueio (tambem da tempo do servidor creditar os pontos antes da leitura).
@@ -675,6 +679,10 @@ namespace FIEMGPlayBot
 
         static void AppendDone(string path, string id)
         { try { File.AppendAllText(path, id + Environment.NewLine); } catch { } }
+
+        // Grava (SOBRESCREVENDO) o ID do ultimo post analisado — o arquivo mantem sempre apenas o mais recente.
+        static void WriteLast(string path, string id)
+        { try { File.WriteAllText(path, id + Environment.NewLine); } catch { } }
 
         // -----------------------------------------------------------------
         // Edge

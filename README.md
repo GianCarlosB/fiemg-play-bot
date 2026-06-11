@@ -37,7 +37,7 @@ gerenciamento de memória.
 | `feedTab` | **(padrão `"Social"`)** Aba aberta antes de coletar os posts. A aba **Social** carrega **mais postagens** que a **Início**. Deixe **vazio** (`""`) para usar a aba atual (Início). |
 | `headless` | `true` = sem janela (produção). `false` ajuda a depurar visualmente. |
 | `verbose` | `true` = logs de diagnóstico detalhados (login/feed). |
-| `blockImages` | `true` bloqueia imagens (menos RAM), mas pode atrapalhar o clique nos corações. Padrão `false`. |
+| `blockImages` | **(padrão `true`)** Bloqueia imagens → feed mais leve (menos RAM e menos travadas do renderer). **Seguro:** a reação usa `rateClick` via `.click()` no elemento, sem depender da imagem carregada. |
 | `minDelayMs` / `maxDelayMs` | Intervalo aleatório entre reações (anti-bloqueio). |
 | `longPauseEveryLikes` / `longPauseMs` | Pausa longa a cada N reações. |
 | `reloadEveryLikes` | Recarrega a página a cada N reações para liberar memória (DOM acumulado). |
@@ -45,7 +45,8 @@ gerenciamento de memória.
 | `maxEmptyScrollRounds` | Tentativas vazias seguidas (sem posts novos e sem "Carregar mais") antes de encerrar. **`0` (padrão) = nunca desiste sozinho** — o bot só para por interrupção do usuário ou erro crítico. |
 | `maxHearts` | **(padrão `true`)** Sempre avalia com o **máximo de corações** (o de maior valor = "Amei"), robusto a qualquer quantidade. Quando `true`, ignora `heartIndex`. |
 | `heartIndex` | Usado **só quando `maxHearts: false`**. Qual reação clicar (1=":-(", 2=":-|", 3=":-)", 4="Uhuu", **5="Amei"**). |
-| `doneFile` | Arquivo com os IDs já processados (dedup entre execuções). |
+| `doneFile` | Arquivo com os IDs das curtidas que **renderam pontos** (dedup entre execuções). |
+| `lastFile` | Arquivo que guarda **apenas o ID do último post analisado** (sobrescrito a cada post, com ou sem ganho). |
 
 ## Como funciona (resumo técnico)
 
@@ -127,4 +128,5 @@ o risco de bloqueio. Automação pode violar os Termos de Uso da plataforma — 
 - `run.bat` — compila com o `csc` in-box e executa. **Versionado.**
 - `README.md` / `LICENSE` — documentação e licença. **Versionados.**
 - `FIEMGPlayBot.exe` — gerado pela compilação. **Ignorado pelo Git.**
-- `done.txt` — IDs já processados (gerado em runtime). **Ignorado pelo Git.**
+- `done.txt` — IDs das curtidas que renderam pontos (gerado em runtime). **Ignorado pelo Git.**
+- `last.txt` — ID do último post analisado (gerado em runtime). **Ignorado pelo Git.**

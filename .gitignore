@@ -6,4 +6,5 @@ FIEMGPlayBot.exe
 
 # Arquivos de runtime
 done.txt
+last.txt
 *.log
