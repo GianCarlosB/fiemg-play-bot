@@ -6,6 +6,7 @@
   "password": "SUA_SENHA_AQUI",
 
   "edgePort": 9222,
+  "cdpTimeoutMs": 30000,
   "headless": true,
   "blockImages": false,
   "verbose": true,

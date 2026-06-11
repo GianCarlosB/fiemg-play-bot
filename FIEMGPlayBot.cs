@@ -36,6 +36,7 @@ namespace FIEMGPlayBot
         public string Email = "";
         public string Password = "";
         public int EdgePort = 9222;
+        public int CdpTimeoutMs = 30000;     // timeout por chamada CDP; se a pagina parar de responder, lanca erro em vez de travar
         public bool Headless = true;
         public bool BlockImages = false;     // desligar imagens economiza RAM, mas pode quebrar o clique nos coracoes
         public int MinDelayMs = 2500;
@@ -64,6 +65,7 @@ namespace FIEMGPlayBot
             c.Email = Str(d, "email", c.Email);
             c.Password = Str(d, "password", c.Password);
             c.EdgePort = Int(d, "edgePort", c.EdgePort);
+            c.CdpTimeoutMs = Int(d, "cdpTimeoutMs", c.CdpTimeoutMs);
             c.Headless = Bool(d, "headless", c.Headless);
             c.BlockImages = Bool(d, "blockImages", c.BlockImages);
             c.MinDelayMs = Int(d, "minDelayMs", c.MinDelayMs);
@@ -98,6 +100,7 @@ namespace FIEMGPlayBot
         readonly JavaScriptSerializer _ser = new JavaScriptSerializer();
         public readonly List<string> Events = new List<string>();
         int _id = 0;
+        public int TimeoutMs = 30000;   // timeout por chamada CDP: se a pagina/renderer travar, lanca em vez de pendurar
 
         public Cdp() { _ser.MaxJsonLength = 64 * 1024 * 1024; }
 
@@ -144,38 +147,52 @@ namespace FIEMGPlayBot
             msg["method"] = method;
             if (prms != null) msg["params"] = prms;
             string json = _ser.Serialize(msg);
-            await _ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)),
-                                WebSocketMessageType.Text, true, CancellationToken.None);
 
-            while (true)
+            // Timeout por chamada: o token cancela o send/receive se a resposta nao chegar a tempo,
+            // evitando o bot pendurar para sempre quando o renderer do Edge trava.
+            using (var cts = new CancellationTokenSource(TimeoutMs))
             {
-                string resp = await Receive();
-                var d = _ser.DeserializeObject(resp) as Dictionary<string, object>;
-                if (d == null) continue;
-                if (d.ContainsKey("id") && Convert.ToInt32(d["id"]) == id)
-                    return d; // resposta do nosso comando
-                // captura eventos de erro/log para diagnostico
-                if (d.ContainsKey("method"))
+                try
                 {
-                    string m = Convert.ToString(d["method"]);
-                    if ((m == "Runtime.exceptionThrown" || m == "Log.entryAdded") && Events.Count < 200)
+                    await _ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)),
+                                        WebSocketMessageType.Text, true, cts.Token);
+
+                    while (true)
                     {
-                        object prm = d.ContainsKey("params") ? d["params"] : null;
-                        string s = prm != null ? _ser.Serialize(prm) : "";
-                        if (s.Length > 280) s = s.Substring(0, 280);
-                        Events.Add(m + " " + s);
+                        string resp = await Receive(cts.Token);
+                        var d = _ser.DeserializeObject(resp) as Dictionary<string, object>;
+                        if (d == null) continue;
+                        if (d.ContainsKey("id") && Convert.ToInt32(d["id"]) == id)
+                            return d; // resposta do nosso comando
+                        // captura eventos de erro/log para diagnostico
+                        if (d.ContainsKey("method"))
+                        {
+                            string m = Convert.ToString(d["method"]);
+                            if ((m == "Runtime.exceptionThrown" || m == "Log.entryAdded") && Events.Count < 200)
+                            {
+                                object prm = d.ContainsKey("params") ? d["params"] : null;
+                                string s = prm != null ? _ser.Serialize(prm) : "";
+                                if (s.Length > 280) s = s.Substring(0, 280);
+                                Events.Add(m + " " + s);
+                            }
+                        }
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw new TimeoutException("Sem resposta CDP em " + (TimeoutMs / 1000)
+                        + "s para o comando '" + method + "' (a pagina/renderer do Edge parou de responder).");
                 }
             }
         }
 
-        async Task<string> Receive()
+        async Task<string> Receive(CancellationToken ct)
         {
             var ms = new MemoryStream();
             var buf = new byte[16384];
             while (true)
             {
-                var res = await _ws.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None);
+                var res = await _ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
                 if (res.MessageType == WebSocketMessageType.Close)
                     throw new Exception("WebSocket fechado pelo Edge.");
                 ms.Write(buf, 0, res.Count);
@@ -332,6 +349,7 @@ namespace FIEMGPlayBot
             Log("Edge iniciado (PID " + proc.Id + "). Conectando via CDP...");
 
             _cdp = new Cdp();
+            _cdp.TimeoutMs = _cfg.CdpTimeoutMs;
             try
             {
                 await _cdp.ConnectAsync(_cfg.EdgePort);
@@ -454,8 +472,8 @@ namespace FIEMGPlayBot
                         bool gained = (lastPoints >= 0 && after >= 0 && after > lastPoints);
                         if (gained) AppendDone(donePath, id);
                         string delta = (lastPoints >= 0 && after >= 0)
-                            ? (gained ? (" (+" + (after - lastPoints) + " pts -> " + after + "; gravado em done.txt)")
-                                      : " (sem ganho: ja contabilizado; NAO gravado em done.txt)")
+                            ? (gained ? (" (+" + (after - lastPoints) + " pts -> " + after + ")")
+                                      : " (sem ganho)")
                             : "";
                         if (after >= 0) lastPoints = after;
                         Log("[" + totalLiked + "] post " + id + (acted ? " avaliado" : " sem widget/pulado") + delta);
@@ -489,22 +507,18 @@ namespace FIEMGPlayBot
             Log("FIM. Total de posts avaliados nesta execucao: " + totalLiked + ".");
         }
 
-        // Reage a um post clicando no coracao escolhido (rating_options costuma estar visivel).
-        // Se estiver oculto, revela clicando no .beforeRated primeiro.
+        // Reage a um post acionando o coracao escolhido via seu onclick INLINE (rateClick -> envia a
+        // nota ao ZK por comm.sendEvent). Bem mais robusto que clique por coordenada: os coracoes
+        // ficam ocultos (so aparecem no hover) e tem larguras/posicoes que faziam o clique por pixel
+        // cair no coracao errado (dava nota 2 em vez de 5). Chamar .click() dispara a nota CERTA
+        // independentemente de visibilidade/posicao. MaxHearts manda indice alto e o JS limita ao
+        // ultimo coracao (maior valor = "Amei").
         static async Task<bool> ReactToPost(string id)
         {
-            // MaxHearts: passa um indice alto; o JS limita ao ultimo coracao (o de maior valor).
             int idx = _cfg.MaxHearts ? 999 : _cfg.HeartIndex;
-            string heart = BuildJs(JS_HEART_CENTER, id, idx);
-            double[] c = await GetCenter(heart);
-            if (c == null)
-            {
-                var cb = await GetCenter(BuildJs(JS_BEFORE_CENTER, id, 0));
-                if (cb != null) { await _cdp.ClickAt(cb[0], cb[1]); await Task.Delay(500); }
-                await WaitUntil(async () => { c = await GetCenter(heart); return c != null; }, 2500, 300);
-            }
-            if (c != null) { await _cdp.ClickAt(c[0], c[1]); await Task.Delay(400); return true; }
-            return false; // post sem widget de reacao
+            string r = await _cdp.EvalStr(BuildJs(JS_RATE, id, idx));
+            if (r == "ok") { await Task.Delay(400); return true; }
+            return false; // post sem widget de reacao (ou nao encontrado na tela)
         }
 
         static async Task ReloadFeed()
@@ -832,39 +846,25 @@ namespace FIEMGPlayBot
   return null;
 })()";
 
-        // Centro do .beforeRated do post __ID__ (fallback p/ revelar os coracoes; null se oculto/ausente)
-        const string JS_BEFORE_CENTER = @"
+        // Aciona o coracao __IDX__ do post __ID__ chamando seu onclick INLINE (rateClick), que envia
+        // a nota ao ZK via comm.sendEvent. __IDX__ e a nota (1..N; com MaxHearts vem alto e e limitado
+        // ao ultimo = maior valor = 'Amei'). Cada coracao tem onclick=rateClick(win,N,postid), entao
+        // disparar .click() no coracao N submete a nota N — sem depender de coordenada/hover (os
+        // coracoes ficam ocultos e o clique por pixel caia no coracao errado). Retorna 'ok',
+        // 'noimg' (widget sem coracoes) ou 'notfound' (post nao esta na tela).
+        const string JS_RATE = @"
 (function(){
   var opts=document.querySelectorAll('.rating_options');
   for(var i=0;i<opts.length;i++){
-    if((opts[i].className||'').split(/\s+/).indexOf('__ID__')>=0){
-      var b=opts[i].parentElement.querySelector('.beforeRated'); if(!b) return null;
-      if(getComputedStyle(b).display==='none') return null;
-      b.scrollIntoView({block:'center'});
-      var r=b.getBoundingClientRect();
-      if(r.width<=0||r.height<=0) return null;
-      return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
-    }
+    var o=opts[i];
+    if((''+(o.className||'')).split(/\s+/).indexOf('__ID__')<0) continue;
+    var imgs=o.querySelectorAll('img');
+    if(imgs.length===0) return 'noimg';
+    var idx=__IDX__; if(idx<1)idx=1; if(idx>imgs.length)idx=imgs.length;
+    imgs[idx-1].click();
+    return 'ok';
   }
-  return null;
-})()";
-
-        // Centro do coracao __IDX__ (1..5; 5='Amei') do post __ID__, se rating_options visivel
-        const string JS_HEART_CENTER = @"
-(function(){
-  var opts=document.querySelectorAll('.rating_options');
-  for(var i=0;i<opts.length;i++){
-    if((opts[i].className||'').split(/\s+/).indexOf('__ID__')>=0){
-      var o=opts[i];
-      if(getComputedStyle(o).display==='none') return null;
-      var hs=o.querySelectorAll('img'); if(hs.length===0) return null;
-      var idx=__IDX__; if(idx<1)idx=1; if(idx>hs.length)idx=hs.length;
-      var h=hs[idx-1]; h.scrollIntoView({block:'center'});
-      var r=h.getBoundingClientRect(); if(r.width<=0) return null;
-      return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
-    }
-  }
-  return null;
+  return 'notfound';
 })()";
 
         // Pontos do cabecalho (numero formatado tipo 186.910, perto da palavra 'pontos')
