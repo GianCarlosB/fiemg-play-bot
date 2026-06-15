@@ -435,6 +435,7 @@ namespace FIEMGPlayBot
         static async Task FeedLoop()
         {
             await EnsureFeedLoaded();
+            await DismissBlockingModal(); // fecha o popup diario (Web Check In) que cobre o feed e trava o 'Carregar mais'
 
             string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
             string lastPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.LastFile);
@@ -544,6 +545,7 @@ namespace FIEMGPlayBot
         // Clica em 'Carregar mais' (se existir) e espera novos posts. Retorna true se carregou mais.
         static async Task<bool> TryLoadMore()
         {
+            await DismissBlockingModal(); // sem isso, a mascara do popup intercepta o clique no 'Carregar mais'
             var c = await GetCenter(JS_CARREGAR_CENTER);
             if (c == null) return false; // botao ausente => nao ha mais posts
             int before = await _cdp.EvalInt(JS_FEED_COUNT, 0);
@@ -554,6 +556,23 @@ namespace FIEMGPlayBot
             Log("'Carregar mais': posts " + before + " -> " + after + (grew ? "" : " (sem novos)"));
             await Task.Delay(800);
             return grew;
+        }
+
+        // Fecha um popup MODAL do ZK que esteja cobrindo a pagina com '.z-modal-mask' — tipicamente o
+        // "Web Check In" diario. A mascara (z-index alto) intercepta os cliques por COORDENADA, travando
+        // o 'Carregar mais' (clique trusted) em loop nos primeiros posts — enquanto coracoes/abas seguem
+        // funcionando por usarem .click() via JS (que ignora a mascara). Rola ao topo e da um clique
+        // trusted no card do modal, o que REIVINDICA os +50 e fecha o popup; com fallback que esconde a
+        // mascara via JS caso o fechamento normal nao resolva.
+        static async Task DismissBlockingModal()
+        {
+            if (await _cdp.EvalInt(JS_HAS_MODAL_MASK, 0) <= 0) return; // nada bloqueando
+            Log("Popup modal cobrindo o feed (ex.: Web Check In diario); fechando para liberar o 'Carregar mais'...");
+            double[] c = await GetCenter(JS_MODAL_CENTER); // ja rola ao topo e retorna o centro do modal
+            if (c != null) { await _cdp.ClickAt(c[0], c[1]); await Task.Delay(1200); }
+            if (await _cdp.EvalInt(JS_HAS_MODAL_MASK, 0) > 0)
+            { await _cdp.Eval(JS_HIDE_MODAL_MASK); Log("Mascara modal removida via fallback."); }
+            else Log("Popup fechado.");
         }
 
         // Abre a aba de feed configurada (ex.: "Social", que carrega MAIS posts que "Inicio").
@@ -853,6 +872,33 @@ namespace FIEMGPlayBot
   }
   return null;
 })()";
+
+        // Conta mascaras modais do ZK ATIVAS (visiveis). >0 = ha um popup (ex.: Web Check In) cobrindo
+        // a pagina e bloqueando os cliques por coordenada (como o do 'Carregar mais').
+        const string JS_HAS_MODAL_MASK = @"
+(function(){ var m=document.querySelectorAll('.z-modal-mask'); var n=0;
+  for(var i=0;i<m.length;i++){ if(getComputedStyle(m[i]).display!=='none') n++; } return n; })()";
+
+        // Centro do modal do ZK visivel. Rola ao topo antes (o modal e position:absolute em top:100,
+        // entao some da viewport quando a pagina esta rolada). Clicar no centro do card do Web Check In
+        // reivindica os +50 e fecha o popup.
+        const string JS_MODAL_CENTER = @"
+(function(){
+  var w=document.querySelector('.z-window-modal');
+  if(!w || w.offsetParent===null) return null;
+  window.scrollTo(0,0);
+  var r=w.getBoundingClientRect();
+  if(r.width<=0||r.height<=0) return null;
+  return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);
+})()";
+
+        // Fallback: esconde mascara(s)/modal(is) via JS para liberar os cliques por coordenada,
+        // caso o fechamento normal (clicar no card) nao resolva.
+        const string JS_HIDE_MODAL_MASK = @"
+(function(){ var n=0;
+  var m=document.querySelectorAll('.z-modal-mask'); for(var i=0;i<m.length;i++){ m[i].style.display='none'; n++; }
+  var w=document.querySelectorAll('.z-window-modal'); for(var j=0;j<w.length;j++){ w[j].style.display='none'; }
+  return n; })()";
 
         // Aciona o coracao __IDX__ do post __ID__ chamando seu onclick INLINE (rateClick), que envia
         // a nota ao ZK via comm.sendEvent. __IDX__ e a nota (1..N; com MaxHearts vem alto e e limitado
