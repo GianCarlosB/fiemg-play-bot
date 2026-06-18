@@ -43,7 +43,7 @@ gerenciamento de memória.
 | `reloadEveryLikes` | Recarrega a página a cada N reações para liberar memória (DOM acumulado). |
 | `maxLikes` | Limite total por execução (`0` = sem limite). |
 | `maxEmptyScrollRounds` | Tentativas vazias seguidas (sem posts novos e sem "Carregar mais") antes de encerrar. **`0` (padrão) = nunca desiste sozinho** — o bot só para por interrupção do usuário ou erro crítico. |
-| `skipPages` | Antes de começar a analisar, **pula N páginas** clicando direto no "Carregar mais" (sem avaliar). Útil para começar mais **fundo no histórico**. `0` (padrão) = não pula. Se o feed acabar antes de N, a análise inicia de onde chegou. |
+| `skipPages` | Antes de analisar, **pula N páginas** clicando direto no "Carregar mais" (sem avaliar) e marca o que ficou acima como já processado — então a análise **começa a partir da página pulada** (mais fundo no histórico), e **não do topo**. `0` (padrão) = não pula. Se o feed acabar antes de N, para. |
 | `maxHearts` | **(padrão `true`)** Sempre avalia com o **máximo de corações** (o de maior valor = "Amei"), robusto a qualquer quantidade. Quando `true`, ignora `heartIndex`. |
 | `heartIndex` | Usado **só quando `maxHearts: false`**. Qual reação clicar (1=":-(", 2=":-|", 3=":-)", 4="Uhuu", **5="Amei"**). |
 | `doneFile` | Arquivo com os IDs das curtidas que **renderam pontos** (dedup entre execuções). |

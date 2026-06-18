@@ -438,12 +438,15 @@ namespace FIEMGPlayBot
         {
             await EnsureFeedLoaded();
             await DismissBlockingModal(); // fecha o popup diario (Web Check In) que cobre o feed e trava o 'Carregar mais'
-            await SkipPagesAsync(_cfg.SkipPages); // opcional: pula N paginas (Carregar mais) antes de comecar a analisar
 
             string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
             string lastPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.LastFile);
             var done = LoadDone(donePath);
             Log("IDs ja processados carregados: " + done.Count);
+
+            // opcional: pula N paginas (Carregar mais) E marca o que ja foi carregado como processado,
+            // para a analise comecar na pagina pulada (mais fundo), e nao do topo.
+            await SkipPagesAsync(_cfg.SkipPages, done);
 
             int totalLiked = 0;
             int emptyRounds = 0;
@@ -561,21 +564,31 @@ namespace FIEMGPlayBot
             return grew;
         }
 
-        // Antes de analisar, "pula" ate N paginas clicando em 'Carregar mais' (sem avaliar nada),
-        // para comecar a analise mais fundo no historico. Se o feed acabar antes de N, para e segue
-        // a analise de onde chegou. Cada pagina = um clique no 'Carregar mais' (lote de posts mais antigos).
-        static async Task SkipPagesAsync(int n)
+        // Antes de analisar, "pula" ate N paginas clicando em 'Carregar mais' (sem avaliar nada) e
+        // marca como JA PROCESSADO tudo que ficou acima — assim a analise comeca na pagina pulada
+        // (mais fundo no historico) e NAO do topo. Sem essa marcacao, o JS_COLLECT_IDS pegaria os
+        // posts do topo (paginas que deveriam ter sido puladas). Se o feed acabar antes de N, para.
+        // Cada pagina = um clique no 'Carregar mais' (lote de posts mais antigos).
+        static async Task SkipPagesAsync(int n, HashSet<string> done)
         {
             if (n <= 0) return;
-            Log("Pulando ate " + n + " pagina(s) antes de analisar (so 'Carregar mais', sem avaliar)...");
-            int skipped = 0;
-            for (int i = 0; i < n; i++)
+            Log("Pulando " + n + " pagina(s) antes de analisar (so 'Carregar mais', sem avaliar)...");
+            int skipped = 0, fails = 0;
+            while (skipped < n)
             {
-                if (!await TryLoadMore())
-                { Log("Feed acabou ao pular (pagina " + (i + 1) + "/" + n + "); iniciando analise daqui."); break; }
-                skipped++;
+                // marca os posts ja carregados (paginas acima) como processados, antes de carregar a proxima
+                var seen = (await _cdp.EvalStr(JS_COLLECT_IDS) ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var id in seen) done.Add(id);
+
+                if (await TryLoadMore()) { skipped++; fails = 0; continue; }
+
+                // Nao cresceu: pode ser a pagina ainda assentando (logo apos abrir o feed) ou modal tardio,
+                // nao necessariamente o fim. Rola, espera e tenta de novo algumas vezes antes de desistir.
+                if (++fails >= 3) { Log("Feed acabou ao pular (pagina " + (skipped + 1) + "/" + n + ")."); break; }
+                await ScrollDown();
+                await Task.Delay(_cfg.ScrollWaitMs);
             }
-            Log("Paginas puladas: " + skipped + "/" + n + ". Iniciando analise dos posts.");
+            Log("Paginas puladas: " + skipped + "/" + n + ". A analise comeca a partir daqui (mais fundo no historico).");
         }
 
         // Fecha um popup MODAL do ZK que esteja cobrindo a pagina com '.z-modal-mask' — tipicamente o
