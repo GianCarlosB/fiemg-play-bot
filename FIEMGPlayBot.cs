@@ -46,6 +46,7 @@ namespace FIEMGPlayBot
         public int ReloadEveryLikes = 40;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria)
         public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
         public int MaxEmptyScrollRounds = 0; // tentativas vazias seguidas antes de encerrar; 0 = nunca desiste sozinho (so para por interrupcao do usuario ou erro critico)
+        public int SkipPages = 0;            // antes de analisar, pula N paginas clicando em 'Carregar mais' (0 = nao pula). Util p/ comecar mais fundo no historico
         public int ScrollWaitMs = 2500;
         public bool MaxHearts = true;        // SEMPRE clicar no coracao de maior valor (ultimo = "Amei"), robusto a qualquer quantidade
         public int HeartIndex = 5;           // usado apenas quando MaxHearts=false. 1..5 (5="Amei")
@@ -76,6 +77,7 @@ namespace FIEMGPlayBot
             c.ReloadEveryLikes = Int(d, "reloadEveryLikes", c.ReloadEveryLikes);
             c.MaxLikes = Int(d, "maxLikes", c.MaxLikes);
             c.MaxEmptyScrollRounds = Int(d, "maxEmptyScrollRounds", c.MaxEmptyScrollRounds);
+            c.SkipPages = Int(d, "skipPages", c.SkipPages);
             c.ScrollWaitMs = Int(d, "scrollWaitMs", c.ScrollWaitMs);
             c.MaxHearts = Bool(d, "maxHearts", c.MaxHearts);
             c.HeartIndex = Int(d, "heartIndex", c.HeartIndex);
@@ -436,6 +438,7 @@ namespace FIEMGPlayBot
         {
             await EnsureFeedLoaded();
             await DismissBlockingModal(); // fecha o popup diario (Web Check In) que cobre o feed e trava o 'Carregar mais'
+            await SkipPagesAsync(_cfg.SkipPages); // opcional: pula N paginas (Carregar mais) antes de comecar a analisar
 
             string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
             string lastPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.LastFile);
@@ -556,6 +559,23 @@ namespace FIEMGPlayBot
             Log("'Carregar mais': posts " + before + " -> " + after + (grew ? "" : " (sem novos)"));
             await Task.Delay(800);
             return grew;
+        }
+
+        // Antes de analisar, "pula" ate N paginas clicando em 'Carregar mais' (sem avaliar nada),
+        // para comecar a analise mais fundo no historico. Se o feed acabar antes de N, para e segue
+        // a analise de onde chegou. Cada pagina = um clique no 'Carregar mais' (lote de posts mais antigos).
+        static async Task SkipPagesAsync(int n)
+        {
+            if (n <= 0) return;
+            Log("Pulando ate " + n + " pagina(s) antes de analisar (so 'Carregar mais', sem avaliar)...");
+            int skipped = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (!await TryLoadMore())
+                { Log("Feed acabou ao pular (pagina " + (i + 1) + "/" + n + "); iniciando analise daqui."); break; }
+                skipped++;
+            }
+            Log("Paginas puladas: " + skipped + "/" + n + ". Iniciando analise dos posts.");
         }
 
         // Fecha um popup MODAL do ZK que esteja cobrindo a pagina com '.z-modal-mask' — tipicamente o

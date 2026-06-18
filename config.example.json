@@ -18,6 +18,7 @@
   "reloadEveryLikes": 0,
   "maxLikes": 0,
   "maxEmptyScrollRounds": 0,
+  "skipPages": 0,
   "scrollWaitMs": 2500,
   "maxHearts": true,
   "heartIndex": 5,
