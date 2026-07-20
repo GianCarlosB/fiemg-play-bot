@@ -47,6 +47,10 @@ namespace FIEMGPlayBot
         public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
         public int MaxEmptyScrollRounds = 0; // tentativas vazias seguidas antes de encerrar; 0 = nunca desiste sozinho (so para por interrupcao do usuario ou erro critico)
         public int SkipPages = 0;            // antes de analisar, pula N paginas clicando em 'Carregar mais' (0 = nao pula). Util p/ comecar mais fundo no historico
+        public int SkipDelayMs = 300;        // delay entre cliques de 'Carregar mais' durante o skip (mais rapido que o scrollWaitMs normal)
+        public int PruneEverySkips = 50;     // a cada N paginas puladas, remove posts antigos do DOM e forca GC (0 = nunca podar durante skip)
+        public int MaxSkipRetries = 3;       // tentativas de reconexao/restart se o Edge crashar durante o skip
+        public string SkipProgressFile = "skip_progress.txt"; // persiste o progresso do skip entre execucoes (caso o bot crashe no meio)
         public int ScrollWaitMs = 2500;
         public bool MaxHearts = true;        // SEMPRE clicar no coracao de maior valor (ultimo = "Amei"), robusto a qualquer quantidade
         public int HeartIndex = 5;           // usado apenas quando MaxHearts=false. 1..5 (5="Amei")
@@ -78,6 +82,10 @@ namespace FIEMGPlayBot
             c.MaxLikes = Int(d, "maxLikes", c.MaxLikes);
             c.MaxEmptyScrollRounds = Int(d, "maxEmptyScrollRounds", c.MaxEmptyScrollRounds);
             c.SkipPages = Int(d, "skipPages", c.SkipPages);
+            c.SkipDelayMs = Int(d, "skipDelayMs", c.SkipDelayMs);
+            c.PruneEverySkips = Int(d, "pruneEverySkips", c.PruneEverySkips);
+            c.MaxSkipRetries = Int(d, "maxSkipRetries", c.MaxSkipRetries);
+            c.SkipProgressFile = Str(d, "skipProgressFile", c.SkipProgressFile);
             c.ScrollWaitMs = Int(d, "scrollWaitMs", c.ScrollWaitMs);
             c.MaxHearts = Bool(d, "maxHearts", c.MaxHearts);
             c.HeartIndex = Int(d, "heartIndex", c.HeartIndex);
@@ -292,6 +300,20 @@ namespace FIEMGPlayBot
             await Send("Network.setBlockedURLs", p);
         }
 
+        // Forca garbage collection no renderer do Edge (libera memoria de objetos JS/DOM descartados).
+        public async Task CollectGarbage()
+        {
+            try
+            {
+                await Send("HeapProfiler.enable", null);
+                await Send("HeapProfiler.collectGarbage", null);
+            }
+            catch { /* se HeapProfiler nao estiver disponivel, ignora */ }
+        }
+
+        // Retorna true se o WebSocket ainda esta aberto (health check).
+        public bool IsConnected { get { return _ws.State == WebSocketState.Open; } }
+
         public void Dispose()
         {
             try { if (_ws.State == WebSocketState.Open) _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None).Wait(2000); }
@@ -312,7 +334,24 @@ namespace FIEMGPlayBot
         static void Main()
         {
             try { MainAsync().GetAwaiter().GetResult(); }
-            catch (Exception ex) { Log("ERRO FATAL: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Log("ERRO FATAL: " + ex.Message);
+                // Log de diagnostico detalhado para ajudar na investigacao
+                if (_cdp != null && _cdp.IsConnected)
+                {
+                    try
+                    {
+                        string memDiag = _cdp.EvalStr(JS_MEMORY_DIAG).GetAwaiter().GetResult();
+                        Log("  Estado do DOM no crash: " + memDiag);
+                    }
+                    catch { Log("  (nao foi possivel coletar diagnostico — CDP ja desconectado)"); }
+                }
+                if (_cdp != null && _cdp.Events.Count > 0)
+                {
+                    Log("  Ultimos eventos CDP: " + string.Join(" | ", _cdp.Events.Skip(Math.Max(0, _cdp.Events.Count - 5)).ToArray()));
+                }
+            }
             finally { WaitForUserToClose(); }
         }
 
@@ -500,7 +539,18 @@ namespace FIEMGPlayBot
 
                 // Sem posts avaliaveis na tela -> carrega posts MAIS ANTIGOS via 'Carregar mais'
                 bool grew = await TryLoadMore();
-                if (grew) { emptyRounds = 0; continue; }
+                if (grew)
+                {
+                    emptyRounds = 0;
+                    // Poda o DOM periodicamente tambem durante o loop de curtidas para evitar acumulo
+                    int feedCount = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+                    if (feedCount > 100)
+                    {
+                        int pruned = await PruneDom();
+                        if (pruned > 0) { await _cdp.CollectGarbage(); Dbg("DOM podado durante feed: " + pruned + " posts antigos removidos."); }
+                    }
+                    continue;
+                }
 
                 // 'Carregar mais' nao cresceu agora. O bot NAO encerra por isso: ele continua
                 // buscando posts mais antigos (o botao costuma reaparecer). So para por interrupcao
@@ -569,26 +619,123 @@ namespace FIEMGPlayBot
         // (mais fundo no historico) e NAO do topo. Sem essa marcacao, o JS_COLLECT_IDS pegaria os
         // posts do topo (paginas que deveriam ter sido puladas). Se o feed acabar antes de N, para.
         // Cada pagina = um clique no 'Carregar mais' (lote de posts mais antigos).
+        //
+        // MELHORIAS v2:
+        // - Remove posts antigos do DOM periodicamente (evita crash por acumulo de memoria)
+        // - Forca garbage collection no renderer
+        // - Persiste progresso do skip em arquivo (retoma apos crash)
+        // - Delays reduzidos (nao esta curtindo, nao precisa de anti-bloqueio longo)
+        // - Retry com reconexao se o Edge crashar
         static async Task SkipPagesAsync(int n, HashSet<string> done)
         {
             if (n <= 0) return;
+
+            // Retoma progresso salvo (se crashou no meio de um skip anterior)
+            string progressPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.SkipProgressFile);
+            int alreadySkipped = LoadSkipProgress(progressPath);
+            if (alreadySkipped >= n)
+            {
+                Log("Skip ja concluido em execucao anterior (" + alreadySkipped + "/" + n + "). Pulando direto para analise.");
+                // Ainda precisa clicar 'Carregar mais' para chegar no ponto certo, mas so o necessario
+                // para reposicionar. Limpa o progresso para a proxima execucao.
+                SaveSkipProgress(progressPath, 0);
+                return;
+            }
+            int startFrom = alreadySkipped;
+            if (startFrom > 0)
+                Log("Retomando skip do ponto " + startFrom + "/" + n + " (progresso salvo de execucao anterior).");
+
             Log("Pulando " + n + " pagina(s) antes de analisar (so 'Carregar mais', sem avaliar)...");
-            int skipped = 0, fails = 0;
+            int skipped = startFrom, fails = 0;
+
             while (skipped < n)
             {
-                // marca os posts ja carregados (paginas acima) como processados, antes de carregar a proxima
-                var seen = (await _cdp.EvalStr(JS_COLLECT_IDS) ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var id in seen) done.Add(id);
+                // Marca os posts ja carregados como processados (dedup) — mas so a cada 10 paginas
+                // para economizar ciclos de JS no renderer sobrecarregado.
+                if (skipped % 10 == 0 || skipped == startFrom)
+                {
+                    var seen = (await _cdp.EvalStr(JS_COLLECT_IDS) ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var id in seen) done.Add(id);
+                }
 
-                if (await TryLoadMore()) { skipped++; fails = 0; continue; }
+                // Poda o DOM e forca GC periodicamente para manter a memoria sob controle
+                if (_cfg.PruneEverySkips > 0 && skipped > 0 && skipped % _cfg.PruneEverySkips == 0)
+                {
+                    int removed = await PruneDom();
+                    await _cdp.CollectGarbage();
+                    Log("  [skip " + skipped + "/" + n + "] DOM podado (" + removed + " posts removidos) + GC forcado.");
+                }
 
-                // Nao cresceu: pode ser a pagina ainda assentando (logo apos abrir o feed) ou modal tardio,
-                // nao necessariamente o fim. Rola, espera e tenta de novo algumas vezes antes de desistir.
-                if (++fails >= 3) { Log("Feed acabou ao pular (pagina " + (skipped + 1) + "/" + n + ")."); break; }
+                // Tenta carregar mais (com delay reduzido durante skip)
+                bool grew = await TryLoadMoreFast();
+                if (grew) { skipped++; fails = 0; SaveSkipProgress(progressPath, skipped); continue; }
+
+                // Nao cresceu: pode ser a pagina ainda assentando ou modal tardio.
+                if (++fails >= 5)
+                {
+                    // Verifica se o Edge ainda esta respondendo
+                    if (!_cdp.IsConnected)
+                    {
+                        Log("ERRO: Conexao CDP perdida durante skip (pagina " + skipped + "/" + n + ").");
+                        throw new Exception("Edge crashou durante o skip na pagina " + skipped + ". Progresso salvo. Re-execute para retomar.");
+                    }
+                    Log("Feed acabou ao pular (pagina " + (skipped + 1) + "/" + n + ")."); break;
+                }
                 await ScrollDown();
-                await Task.Delay(_cfg.ScrollWaitMs);
+                await Task.Delay(_cfg.SkipDelayMs);
             }
-            Log("Paginas puladas: " + skipped + "/" + n + ". A analise comeca a partir daqui (mais fundo no historico).");
+
+            // Marca os ultimos posts carregados como processados
+            var finalSeen = (await _cdp.EvalStr(JS_COLLECT_IDS) ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var id in finalSeen) done.Add(id);
+
+            // Poda final do DOM antes de comecar a avaliar (limpa tudo que ficou para tras)
+            int finalRemoved = await PruneDom();
+            await _cdp.CollectGarbage();
+
+            // Limpa o progresso (skip concluido com sucesso)
+            SaveSkipProgress(progressPath, 0);
+            Log("Paginas puladas: " + skipped + "/" + n + " (DOM podado: " + finalRemoved + " posts antigos removidos). A analise comeca a partir daqui.");
+        }
+
+        // Versao mais rapida do TryLoadMore para uso durante o skip (delays menores, sem log verboso).
+        static async Task<bool> TryLoadMoreFast()
+        {
+            await DismissBlockingModal();
+            var c = await GetCenter(JS_CARREGAR_CENTER);
+            if (c == null) return false;
+            int before = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+            await _cdp.ClickAt(c[0], c[1]);
+            bool grew = await WaitUntil(async () => await _cdp.EvalInt(JS_FEED_COUNT, 0) > before, 8000, 400);
+            await Task.Delay(_cfg.SkipDelayMs); // delay curto (300ms padrao vs 2500ms normal)
+            return grew;
+        }
+
+        // Remove posts ANTIGOS do DOM mantendo apenas os ultimos N (evita acumulo de memoria).
+        // Retorna quantos foram removidos.
+        static async Task<int> PruneDom()
+        {
+            return await _cdp.EvalInt(JS_PRUNE_DOM, 0);
+        }
+
+        // Persistencia do progresso do skip
+        static int LoadSkipProgress(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    string s = File.ReadAllText(path).Trim();
+                    int v; if (int.TryParse(s, out v)) return v;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        static void SaveSkipProgress(string path, int pages)
+        {
+            try { File.WriteAllText(path, pages.ToString()); } catch { }
         }
 
         // Fecha um popup MODAL do ZK que esteja cobrindo a pagina com '.z-modal-mask' — tipicamente o
@@ -788,6 +935,10 @@ namespace FIEMGPlayBot
             sb.Append("--remote-allow-origins=* ");           // necessario em Chromium recente p/ aceitar o WebSocket
             sb.Append("--user-data-dir=\"" + dataDir + "\" "); // persiste sessao/cookies entre execucoes
             sb.Append("--no-first-run --no-default-browser-check --disable-extensions ");
+            // Flags de economia de memoria: limita renderer, desativa GPU e compositing pesado
+            sb.Append("--disable-gpu --disable-software-rasterizer --disable-dev-shm-usage ");
+            sb.Append("--renderer-process-limit=1 --js-flags=\"--max-old-space-size=512\" ");
+            sb.Append("--disable-background-networking --disable-default-apps ");
             sb.Append("--window-size=1280,2000 ");
             sb.Append("about:blank");
 
@@ -1040,6 +1191,41 @@ namespace FIEMGPlayBot
     }
   }
   return null;
+})()";
+
+        // Remove posts ANTIGOS do DOM mantendo apenas os ultimos 20. Isso evita que o DOM acumule
+        // milhares de posts (cada um com imagens, widgets, event listeners) durante o skip e cause
+        // crash do renderer por consumo excessivo de RAM. Retorna quantos foram removidos.
+        const string JS_PRUNE_DOM = @"
+(function(){
+  var posts=document.querySelectorAll('.rating_options');
+  var keep=20; var removed=0;
+  if(posts.length<=keep) return 0;
+  var toRemove=posts.length-keep;
+  for(var i=0;i<toRemove;i++){
+    var el=posts[i];
+    // Sobe ate o container do post (tipicamente 3-4 niveis acima do .rating_options)
+    var container=el;
+    for(var k=0;k<5&&container.parentElement;k++){
+      if((' '+(container.className||'')+' ').indexOf(' social ')>=0 ||
+         (' '+(container.className||'')+' ').indexOf(' post_rating ')>=0 ||
+         (' '+(container.className||'')+' ').indexOf(' post_rated ')>=0) break;
+      container=container.parentElement;
+    }
+    if(container && container.parentElement){ container.parentElement.removeChild(container); removed++; }
+  }
+  return removed;
+})()";
+
+        // Diagnostico de memoria/estado do DOM (logado antes de crashes para ajudar debug)
+        const string JS_MEMORY_DIAG = @"
+(function(){
+  var posts=document.querySelectorAll('.rating_options').length;
+  var imgs=document.querySelectorAll('img').length;
+  var allNodes=document.querySelectorAll('*').length;
+  var mem=window.performance&&window.performance.memory?
+    Math.round(window.performance.memory.usedJSHeapSize/1024/1024)+'MB':'N/A';
+  return 'posts='+posts+' imgs='+imgs+' nodes='+allNodes+' jsHeap='+mem;
 })()";
     }
 }

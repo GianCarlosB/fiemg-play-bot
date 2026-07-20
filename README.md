@@ -48,6 +48,10 @@ gerenciamento de memória.
 | `heartIndex` | Usado **só quando `maxHearts: false`**. Qual reação clicar (1=":-(", 2=":-|", 3=":-)", 4="Uhuu", **5="Amei"**). |
 | `doneFile` | Arquivo com os IDs das curtidas que **renderam pontos** (dedup entre execuções). |
 | `lastFile` | Arquivo que guarda **apenas o ID do último post analisado** (sobrescrito a cada post, com ou sem ganho). |
+| `skipDelayMs` | **(padrão `300`)** Delay em ms entre cliques de "Carregar mais" durante o skip. Muito menor que o delay normal (2500ms) porque não está curtindo — só navegando. Resultado: 3000 páginas em ~15min em vez de ~2h. |
+| `pruneEverySkips` | **(padrão `50`)** A cada N páginas puladas, **remove os posts antigos do DOM** e força garbage collection. **Essa é a melhoria crítica:** impede o acúmulo de milhares de nós DOM que causava o crash. `0` = nunca podar (não recomendado para skips grandes). |
+| `maxSkipRetries` | **(padrão `3`)** Tentativas de retry se o Edge perder conexão durante o skip. |
+| `skipProgressFile` | **(padrão `"skip_progress.txt"`)** Arquivo que salva o progresso do skip. Se o bot crashar na página 2500 de 3000, ao re-executar ele **retoma de onde parou** em vez de recomeçar do zero. |
 
 ## Como funciona (resumo técnico)
 
@@ -121,6 +125,61 @@ gerenciamento de memória.
 Automatiza ações na **sua própria conta**. Os delays evitam sobrecarregar o servidor e reduzem
 o risco de bloqueio. Automação pode violar os Termos de Uso da plataforma — use por sua conta e risco.
 
+## Como ir fundo no feed (skip de 3000+ páginas)
+
+O feed do FIEMG Play carrega **5 posts por "Carregar mais"**. Para chegar em posts de 5-6 meses
+atrás, são ~3000 cliques. Nas versões anteriores o bot **crashava** no meio porque o DOM acumulava
+milhares de nós e o Edge ficava sem memória.
+
+### Solução: novas configs de skip otimizado
+
+No seu `config.json`, use estas configurações:
+
+```json
+{
+  "skipPages": 3000,
+  "skipDelayMs": 300,
+  "pruneEverySkips": 50,
+  "maxSkipRetries": 3,
+  "skipProgressFile": "skip_progress.txt",
+  "blockImages": true,
+  "headless": true
+}
+```
+
+### O que cada flag faz nesse cenário
+
+| Flag | Valor | Efeito |
+|---|---|---|
+| `skipPages` | `3000` | Pula 3000 páginas antes de começar a curtir (chega ~5 meses atrás) |
+| `skipDelayMs` | `300` | Delay de 300ms entre cliques (vs 2500ms normal). Total: ~15min para 3000 páginas |
+| `pruneEverySkips` | `50` | **A cada 50 páginas, remove os posts antigos do DOM.** Isso é o que impede o crash — o Edge nunca acumula mais que ~270 posts na memória (50 páginas × 5 posts + buffer de 20) |
+| `maxSkipRetries` | `3` | Se algo der errado, tenta 3 vezes antes de desistir |
+| `skipProgressFile` | `"skip_progress.txt"` | Se crashar na página 2500, ao rodar de novo **continua da 2500** (não recomeça) |
+| `blockImages` | `true` | Sem imagens = menos RAM consumida durante o skip |
+| `headless` | `true` | Sem interface = menos RAM do renderer |
+
+### Execução
+
+```bat
+rem Primeira vez (compila e roda):
+run.bat
+
+rem Vezes seguintes (ja compilado):
+FIEMGPlayBot.exe
+```
+
+### Se o bot crashar no meio do skip
+
+Basta **rodar de novo** — ele lê o `skip_progress.txt` e retoma do ponto salvo.
+Para forçar recomeçar do zero, delete o `skip_progress.txt`.
+
+### Dicas para skips muito grandes (5000+)
+
+- Use `pruneEverySkips: 30` (poda mais frequente = menos memória)
+- Se mesmo assim crashar, reduza para `pruneEverySkips: 20`
+- O `verbose: true` mostra a cada poda quantos nós foram removidos — útil para monitorar
+
 ## Arquivos
 
 - `FIEMGPlayBot.cs` — código-fonte (único arquivo). **Versionado.**
@@ -131,3 +190,4 @@ o risco de bloqueio. Automação pode violar os Termos de Uso da plataforma — 
 - `FIEMGPlayBot.exe` — gerado pela compilação. **Ignorado pelo Git.**
 - `done.txt` — IDs das curtidas que renderam pontos (gerado em runtime). **Ignorado pelo Git.**
 - `last.txt` — ID do último post analisado (gerado em runtime). **Ignorado pelo Git.**
+- `skip_progress.txt` — Progresso do skip de páginas; permite retomar após crash (gerado em runtime). **Ignorado pelo Git.**
