@@ -296,7 +296,33 @@ namespace FIEMGPlayBot
             await Send("Network.enable", null);
             var p = new Dictionary<string, object>();
             if (enabled) p["urls"] = new string[] { };
-            else p["urls"] = new string[] { "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp" };
+            else p["urls"] = new string[] { "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico" };
+            await Send("Network.setBlockedURLs", p);
+        }
+
+        // Bloqueia URLs de terceiros que embutem iframes pesados (YouTube, Instagram, Facebook, etc.)
+        // Esses embeds carregam scripts enormes que congestionam o renderer e causam o timeout do CDP.
+        public async Task BlockHeavyEmbeds()
+        {
+            await Send("Network.enable", null);
+            // Network.setBlockedURLs se acumula com chamadas anteriores? Nao: sobrescreve.
+            // Entao precisamos combinar tudo numa lista so.
+            var urls = new List<string>();
+            urls.AddRange(new string[] { "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico" }); // imagens
+            urls.AddRange(new string[] {
+                "*youtube.com*", "*youtu.be*", "*ytimg.com*",        // YouTube
+                "*instagram.com*", "*cdninstagram.com*",             // Instagram
+                "*facebook.com*", "*fbcdn.net*",                     // Facebook
+                "*twitter.com*", "*x.com*", "*twimg.com*",           // Twitter/X
+                "*tiktok.com*",                                       // TikTok
+                "*vimeo.com*", "*player.vimeo.com*",                 // Vimeo
+                "*spotify.com*",                                      // Spotify
+                "*googlevideo.com*", "*googleusercontent.com*",      // Google media
+                "*.mp4", "*.webm", "*.ogg", "*.mp3",                // media direto
+                "*analytics*", "*tracking*", "*doubleclick*"         // trackers
+            });
+            var p = new Dictionary<string, object>();
+            p["urls"] = urls.ToArray();
             await Send("Network.setBlockedURLs", p);
         }
 
@@ -398,7 +424,7 @@ namespace FIEMGPlayBot
                 await _cdp.ConnectAsync(_cfg.EdgePort);
                 await _cdp.Send("Page.enable", null);
                 await _cdp.Send("Runtime.enable", null);
-                if (_cfg.BlockImages) { await _cdp.SetImagesEnabled(false); Log("Imagens bloqueadas (modo economia de memoria)."); }
+                if (_cfg.BlockImages) { await _cdp.BlockHeavyEmbeds(); Log("Imagens + embeds pesados bloqueados (YouTube/Instagram/etc)."); }
                 Log("Conectado.");
 
                 await EnsureLoggedIn();
@@ -477,6 +503,7 @@ namespace FIEMGPlayBot
         {
             await EnsureFeedLoaded();
             await DismissBlockingModal(); // fecha o popup diario (Web Check In) que cobre o feed e trava o 'Carregar mais'
+            await KillIframes();          // remove embeds pesados ja presentes na carga inicial
 
             string donePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.DoneFile);
             string lastPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, _cfg.LastFile);
@@ -490,9 +517,15 @@ namespace FIEMGPlayBot
             int totalLiked = 0;
             int emptyRounds = 0;
             int lastPoints = await GetPoints(); // ponto de partida p/ mostrar o delta por curtida
+            int timeoutRetries = 0;
+            const int MAX_TIMEOUT_RETRIES = 5; // tentativas de recuperacao apos timeout do CDP
+            bool hadTimeout = false;
 
             while (true)
             {
+              hadTimeout = false;
+              try
+              {
                 if (_cfg.MaxLikes > 0 && totalLiked >= _cfg.MaxLikes)
                 { Log("Limite de " + _cfg.MaxLikes + " avaliacoes atingido."); break; }
 
@@ -563,6 +596,35 @@ namespace FIEMGPlayBot
                     Log("Sem novos posts no momento (tentativa " + emptyRounds + "); rolando e seguindo a busca por posts mais antigos...");
                 await ScrollDown();
                 await Task.Delay(_cfg.ScrollWaitMs);
+
+                // Iteracao completou sem erro: reseta o contador de timeouts
+                timeoutRetries = 0;
+
+              } // fim do try
+              catch (TimeoutException tex)
+              {
+                hadTimeout = true;
+                timeoutRetries++;
+                Log("TIMEOUT CDP (" + timeoutRetries + "/" + MAX_TIMEOUT_RETRIES + "): " + tex.Message);
+              }
+
+              // Recuperacao apos timeout (fora do catch para poder usar await em C# 5)
+              if (hadTimeout)
+              {
+                  if (timeoutRetries >= MAX_TIMEOUT_RETRIES)
+                  {
+                      Log("Maximo de retries por timeout atingido. Tentando recarregar pagina...");
+                      await ReloadFeed();
+                      timeoutRetries = 0;
+                      Log("Pagina recarregada com sucesso. Continuando...");
+                  }
+                  else
+                  {
+                      Log("Aguardando 10s e tentando aliviar o renderer...");
+                      await Task.Delay(10000);
+                      try { await KillIframes(); await PruneDom(); await _cdp.CollectGarbage(); } catch { }
+                  }
+              }
             }
 
             Log("FIM. Total de posts avaliados nesta execucao: " + totalLiked + ".");
@@ -609,6 +671,8 @@ namespace FIEMGPlayBot
             await _cdp.ClickAt(c[0], c[1]);
             bool grew = await WaitUntil(async () => await _cdp.EvalInt(JS_FEED_COUNT, 0) > before, 12000, 700);
             int after = await _cdp.EvalInt(JS_FEED_COUNT, 0);
+            // Remove iframes pesados recem-carregados (YouTube/Instagram/etc) antes que travem o renderer
+            await KillIframes();
             Log("'Carregar mais': posts " + before + " -> " + after + (grew ? "" : " (sem novos)"));
             await Task.Delay(800);
             return grew;
@@ -707,6 +771,8 @@ namespace FIEMGPlayBot
             int before = await _cdp.EvalInt(JS_FEED_COUNT, 0);
             await _cdp.ClickAt(c[0], c[1]);
             bool grew = await WaitUntil(async () => await _cdp.EvalInt(JS_FEED_COUNT, 0) > before, 8000, 400);
+            // Remove iframes pesados recem-carregados antes que congestionem o renderer
+            await KillIframes();
             await Task.Delay(_cfg.SkipDelayMs); // delay curto (300ms padrao vs 2500ms normal)
             return grew;
         }
@@ -716,6 +782,18 @@ namespace FIEMGPlayBot
         static async Task<int> PruneDom()
         {
             return await _cdp.EvalInt(JS_PRUNE_DOM, 0);
+        }
+
+        // Remove iframes pesados de terceiros (YouTube, Instagram, etc.) do DOM.
+        // Chamado apos cada 'Carregar mais' para eliminar embeds antes que congestionem o renderer.
+        static async Task KillIframes()
+        {
+            try
+            {
+                int killed = await _cdp.EvalInt(JS_KILL_IFRAMES, 0);
+                if (killed > 0) Dbg("  Iframes removidos: " + killed);
+            }
+            catch { /* se o eval falhar por timeout, nao e critico aqui */ }
         }
 
         // Persistencia do progresso do skip
@@ -1195,16 +1273,28 @@ namespace FIEMGPlayBot
 
         // Remove posts ANTIGOS do DOM mantendo apenas os ultimos 20. Isso evita que o DOM acumule
         // milhares de posts (cada um com imagens, widgets, event listeners) durante o skip e cause
-        // crash do renderer por consumo excessivo de RAM. Retorna quantos foram removidos.
+        // crash do renderer por consumo excessivo de RAM. TAMBEM remove TODOS os iframes de terceiros
+        // (YouTube, Instagram, etc) que congestionam o renderer com scripts pesados.
+        // Retorna quantos posts foram removidos.
         const string JS_PRUNE_DOM = @"
 (function(){
+  // 1) Remove TODOS os iframes de embeds pesados (YouTube, Instagram, Facebook, etc.)
+  var iframes=document.querySelectorAll('iframe');
+  for(var f=0;f<iframes.length;f++){
+    var src=(iframes[f].src||'').toLowerCase();
+    if(src.indexOf('youtube')>=0||src.indexOf('instagram')>=0||src.indexOf('facebook')>=0||
+       src.indexOf('twitter')>=0||src.indexOf('tiktok')>=0||src.indexOf('vimeo')>=0||
+       src.indexOf('spotify')>=0||src.indexOf('x.com')>=0){
+      iframes[f].parentElement.removeChild(iframes[f]);
+    }
+  }
+  // 2) Remove posts antigos mantendo apenas os ultimos 20
   var posts=document.querySelectorAll('.rating_options');
   var keep=20; var removed=0;
   if(posts.length<=keep) return 0;
   var toRemove=posts.length-keep;
   for(var i=0;i<toRemove;i++){
     var el=posts[i];
-    // Sobe ate o container do post (tipicamente 3-4 niveis acima do .rating_options)
     var container=el;
     for(var k=0;k<5&&container.parentElement;k++){
       if((' '+(container.className||'')+' ').indexOf(' social ')>=0 ||
@@ -1215,6 +1305,23 @@ namespace FIEMGPlayBot
     if(container && container.parentElement){ container.parentElement.removeChild(container); removed++; }
   }
   return removed;
+})()";
+
+        // Remove iframes pesados de terceiros do DOM (chamado independentemente da poda de posts).
+        // Util apos cada 'Carregar mais' para eliminar embeds recem-carregados antes que eles
+        // congestionem o renderer.
+        const string JS_KILL_IFRAMES = @"
+(function(){
+  var iframes=document.querySelectorAll('iframe'); var killed=0;
+  for(var f=0;f<iframes.length;f++){
+    var src=(iframes[f].src||'').toLowerCase();
+    if(src.indexOf('youtube')>=0||src.indexOf('instagram')>=0||src.indexOf('facebook')>=0||
+       src.indexOf('twitter')>=0||src.indexOf('tiktok')>=0||src.indexOf('vimeo')>=0||
+       src.indexOf('spotify')>=0||src.indexOf('x.com')>=0||src.indexOf('embed')>=0){
+      try{iframes[f].parentElement.removeChild(iframes[f]); killed++;}catch(e){}
+    }
+  }
+  return killed;
 })()";
 
         // Diagnostico de memoria/estado do DOM (logado antes de crashes para ajudar debug)
