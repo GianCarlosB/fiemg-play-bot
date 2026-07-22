@@ -356,6 +356,8 @@ namespace FIEMGPlayBot
         static readonly Random _rng = new Random();
         static Config _cfg;
         static Cdp _cdp;
+        static string _dataDir;  // perfil do Edge (para reconexao)
+        static string _edgePath; // caminho do msedge.exe (para reconexao)
 
         static void Main()
         {
@@ -412,30 +414,65 @@ namespace FIEMGPlayBot
             string edge = FindEdge();
             if (edge == null) { Log("msedge.exe nao encontrado. Instale o Microsoft Edge."); return; }
 
-            string dataDir = Path.Combine(Path.GetTempPath(), "FIEMGPlayBot_profile");
-            KillStaleEdge(dataDir); // evita travar em "Conectando via CDP..." por Edge orfao de execucao anterior
-            Process proc = LaunchEdge(edge, dataDir);
-            Log("Edge iniciado (PID " + proc.Id + "). Conectando via CDP...");
+            _dataDir = Path.Combine(Path.GetTempPath(), "FIEMGPlayBot_profile");
+            _edgePath = edge;
 
-            _cdp = new Cdp();
-            _cdp.TimeoutMs = _cfg.CdpTimeoutMs;
-            try
-            {
-                await _cdp.ConnectAsync(_cfg.EdgePort);
-                await _cdp.Send("Page.enable", null);
-                await _cdp.Send("Runtime.enable", null);
-                if (_cfg.BlockImages) { await _cdp.BlockHeavyEmbeds(); Log("Imagens + embeds pesados bloqueados (YouTube/Instagram/etc)."); }
-                Log("Conectado.");
+            // Loop de resiliencia: se o Edge crashar ou a conexao cair, relanca tudo e continua
+            // do ponto onde parou (skip_progress.txt + done.txt persistem o estado).
+            int sessionRetries = 0;
+            const int MAX_SESSION_RETRIES = 10;
 
-                await EnsureLoggedIn();
-                await FeedLoop();
-            }
-            finally
+            while (sessionRetries < MAX_SESSION_RETRIES)
             {
-                _cdp.Dispose();
-                try { if (!proc.HasExited) proc.Kill(); } catch { }
-                Log("Encerrado.");
+                Process proc = null;
+                try
+                {
+                    KillStaleEdge(_dataDir);
+                    proc = LaunchEdge(edge, _dataDir);
+                    Log("Edge iniciado (PID " + proc.Id + "). Conectando via CDP...");
+
+                    _cdp = new Cdp();
+                    _cdp.TimeoutMs = _cfg.CdpTimeoutMs;
+                    await _cdp.ConnectAsync(_cfg.EdgePort);
+                    await _cdp.Send("Page.enable", null);
+                    await _cdp.Send("Runtime.enable", null);
+                    if (_cfg.BlockImages) { await _cdp.BlockHeavyEmbeds(); Log("Imagens + embeds pesados bloqueados."); }
+                    Log("Conectado.");
+
+                    await EnsureLoggedIn();
+                    await FeedLoop();
+                    break; // FeedLoop terminou normalmente (maxLikes atingido ou feed esgotado)
+                }
+                catch (Exception ex)
+                {
+                    sessionRetries++;
+                    bool isRecoverable = (ex is TimeoutException)
+                        || ex.Message.Contains("Aborted")
+                        || ex.Message.Contains("WebSocket fechado")
+                        || ex.Message.Contains("Edge crashou")
+                        || ex.Message.Contains("estado inv");
+
+                    if (!isRecoverable || sessionRetries >= MAX_SESSION_RETRIES)
+                    {
+                        Log("ERRO FATAL (nao recuperavel ou max retries): " + ex.Message);
+                        throw;
+                    }
+
+                    Log("ERRO RECUPERAVEL (" + sessionRetries + "/" + MAX_SESSION_RETRIES + "): " + ex.Message);
+                    Log("Aguardando 15s antes de relançar o Edge e retomar de onde parou...");
+                }
+                finally
+                {
+                    if (_cdp != null) { _cdp.Dispose(); _cdp = null; }
+                    if (proc != null) { try { if (!proc.HasExited) proc.Kill(); } catch { } }
+                }
+
+                // Espera antes de retomar (da tempo do SO liberar os recursos do processo morto)
+                await Task.Delay(15000);
+                Log("Relancando sessao...");
             }
+
+            Log("Encerrado.");
         }
 
         // -----------------------------------------------------------------
