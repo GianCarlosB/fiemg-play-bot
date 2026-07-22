@@ -551,6 +551,13 @@ namespace FIEMGPlayBot
             // para a analise comecar na pagina pulada (mais fundo), e nao do topo.
             await SkipPagesAsync(_cfg.SkipPages, done);
 
+            // AUTO-SKIP: se ja temos posts processados (ex.: apos reconexao), avanca automaticamente
+            // ate encontrar posts que NAO estao no done. Isso evita "recomecar do zero" apos um crash.
+            if (done.Count > 0 && _cfg.SkipPages <= 0)
+            {
+                await AutoSkipToNewPosts(done);
+            }
+
             int totalLiked = 0;
             int emptyRounds = 0;
             int lastPoints = await GetPoints(); // ponto de partida p/ mostrar o delta por curtida
@@ -644,10 +651,24 @@ namespace FIEMGPlayBot
                 timeoutRetries++;
                 Log("TIMEOUT CDP (" + timeoutRetries + "/" + MAX_TIMEOUT_RETRIES + "): " + tex.Message);
               }
+              catch (Exception ex)
+              {
+                // Se o WebSocket morreu (Aborted, fechado), propaga para o MainAsync fazer reconexao
+                if (ex.Message.Contains("Aborted") || ex.Message.Contains("WebSocket fechado") || !_cdp.IsConnected)
+                    throw;
+                // Outros erros inesperados: trata como timeout para tentar recuperar
+                hadTimeout = true;
+                timeoutRetries++;
+                Log("ERRO NO LOOP (" + timeoutRetries + "/" + MAX_TIMEOUT_RETRIES + "): " + ex.Message);
+              }
 
               // Recuperacao apos timeout (fora do catch para poder usar await em C# 5)
               if (hadTimeout)
               {
+                  // Se a conexao ja morreu, nao adianta tentar recuperar aqui — propaga pro MainAsync reconectar
+                  if (!_cdp.IsConnected)
+                      throw new Exception("Conexao CDP perdida (WebSocket Aborted). Propagando para reconexao.");
+
                   if (timeoutRetries >= MAX_TIMEOUT_RETRIES)
                   {
                       Log("Maximo de retries por timeout atingido. Tentando recarregar pagina...");
@@ -713,6 +734,60 @@ namespace FIEMGPlayBot
             Log("'Carregar mais': posts " + before + " -> " + after + (grew ? "" : " (sem novos)"));
             await Task.Delay(800);
             return grew;
+        }
+
+        // AUTO-SKIP: avanca no feed ate encontrar posts que NAO estao no done.txt.
+        // Usado apos reconexao para nao "recomecar do zero" — pula rapidamente os posts
+        // ja processados (que aparecem no topo apos reabrir o feed) ate chegar onde parou.
+        // Diferente do SkipPages (que pula N fixo), este para assim que encontra posts novos.
+        static async Task AutoSkipToNewPosts(HashSet<string> done)
+        {
+            Log("Auto-skip: avancando ate encontrar posts nao processados (ja temos " + done.Count + " no done.txt)...");
+            int pagesSkipped = 0;
+            int maxAutoSkip = 5000; // seguranca: nao ficar em loop infinito
+
+            while (pagesSkipped < maxAutoSkip)
+            {
+                // Verifica se ha posts NAO processados na tela atual
+                string idsCsv = await _cdp.EvalStr(JS_COLLECT_IDS);
+                var ids = (idsCsv ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                var novos = ids.Where(x => !done.Contains(x)).ToArray();
+
+                if (novos.Length > 0)
+                {
+                    Log("Auto-skip concluido: " + pagesSkipped + " paginas puladas. Encontrados " + novos.Length + " posts novos.");
+                    // Poda final do DOM antes de comecar a avaliar
+                    int pruned = await PruneDom();
+                    if (pruned > 0) await _cdp.CollectGarbage();
+                    return;
+                }
+
+                // Todos os posts visiveis ja estao no done.txt -> avanca
+                bool grew = await TryLoadMoreFast();
+                if (!grew)
+                {
+                    // Tenta scroll + retry
+                    await ScrollDown();
+                    await Task.Delay(_cfg.SkipDelayMs);
+                    grew = await TryLoadMoreFast();
+                    if (!grew)
+                    {
+                        Log("Auto-skip: feed acabou apos " + pagesSkipped + " paginas (nao ha mais posts). Seguindo com o que tem.");
+                        break;
+                    }
+                }
+
+                pagesSkipped++;
+
+                // Poda periodica durante o auto-skip (mesma logica do SkipPages)
+                if (_cfg.PruneEverySkips > 0 && pagesSkipped % _cfg.PruneEverySkips == 0)
+                {
+                    int removed = await PruneDom();
+                    await _cdp.CollectGarbage();
+                    if (pagesSkipped % 100 == 0)
+                        Log("  [auto-skip " + pagesSkipped + "] DOM podado (" + removed + " removidos).");
+                }
+            }
         }
 
         // Antes de analisar, "pula" ate N paginas clicando em 'Carregar mais' (sem avaliar nada) e
