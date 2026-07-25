@@ -43,7 +43,7 @@ namespace FIEMGPlayBot
         public int MaxDelayMs = 6000;
         public int LongPauseEveryLikes = 30;
         public int LongPauseMs = 60000;
-        public int ReloadEveryLikes = 30;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria). Valor baixo = mais seguro
+        public int ReloadEveryLikes = 0;     // recarrega a pagina periodicamente p/ zerar o DOM (0 = desabilitado, confia na reconexao automatica)
         public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
         public int MaxEmptyScrollRounds = 0; // tentativas vazias seguidas antes de encerrar; 0 = nunca desiste sozinho (so para por interrupcao do usuario ou erro critico)
         public int SkipPages = 0;            // antes de analisar, pula N paginas clicando em 'Carregar mais' (0 = nao pula). Util p/ comecar mais fundo no historico
