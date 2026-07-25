@@ -36,14 +36,14 @@ namespace FIEMGPlayBot
         public string Email = "";
         public string Password = "";
         public int EdgePort = 9222;
-        public int CdpTimeoutMs = 30000;     // timeout por chamada CDP; se a pagina parar de responder, lanca erro em vez de travar
+        public int CdpTimeoutMs = 15000;     // timeout por chamada CDP; detecta renderer travado mais rapido (15s em vez de 30)
         public bool Headless = true;
         public bool BlockImages = true;      // bloquear imagens deixa o feed leve (menos RAM/travadas). Seguro: a reacao usa rateClick(.click()), nao depende da imagem renderizada
         public int MinDelayMs = 2500;
         public int MaxDelayMs = 6000;
         public int LongPauseEveryLikes = 30;
         public int LongPauseMs = 60000;
-        public int ReloadEveryLikes = 40;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria)
+        public int ReloadEveryLikes = 30;    // recarrega a pagina periodicamente p/ zerar o DOM acumulado (memoria). Valor baixo = mais seguro
         public int MaxLikes = 500;           // limite total por execucao (0 = sem limite)
         public int MaxEmptyScrollRounds = 0; // tentativas vazias seguidas antes de encerrar; 0 = nunca desiste sozinho (so para por interrupcao do usuario ou erro critico)
         public int SkipPages = 0;            // antes de analisar, pula N paginas clicando em 'Carregar mais' (0 = nao pula). Util p/ comecar mais fundo no historico
@@ -358,6 +358,7 @@ namespace FIEMGPlayBot
         static Cdp _cdp;
         static string _dataDir;  // perfil do Edge (para reconexao)
         static string _edgePath; // caminho do msedge.exe (para reconexao)
+        static int _totalLikedSession = 0; // posts curtidos na sessao atual (para resetar retries)
 
         static void Main()
         {
@@ -419,10 +420,12 @@ namespace FIEMGPlayBot
 
             // Loop de resiliencia: se o Edge crashar ou a conexao cair, relanca tudo e continua
             // do ponto onde parou (skip_progress.txt + done.txt persistem o estado).
+            // O contador de retries RESETA quando o bot consegue curtir com sucesso, entao
+            // ele pode reconectar infinitas vezes desde que cada sessao faca progresso.
             int sessionRetries = 0;
-            const int MAX_SESSION_RETRIES = 10;
+            const int MAX_SESSION_RETRIES = 10; // retries CONSECUTIVOS sem progresso
 
-            while (sessionRetries < MAX_SESSION_RETRIES)
+            while (true)
             {
                 Process proc = null;
                 try
@@ -450,16 +453,27 @@ namespace FIEMGPlayBot
                         || ex.Message.Contains("Aborted")
                         || ex.Message.Contains("WebSocket fechado")
                         || ex.Message.Contains("Edge crashou")
-                        || ex.Message.Contains("estado inv");
+                        || ex.Message.Contains("estado inv")
+                        || ex.Message.Contains("Conexao CDP perdida")
+                        || ex.Message.Contains("Propagando para reconexao");
 
                     if (!isRecoverable || sessionRetries >= MAX_SESSION_RETRIES)
                     {
-                        Log("ERRO FATAL (nao recuperavel ou max retries): " + ex.Message);
+                        Log("ERRO FATAL (nao recuperavel ou " + sessionRetries + " retries sem progresso): " + ex.Message);
                         throw;
                     }
 
                     Log("ERRO RECUPERAVEL (" + sessionRetries + "/" + MAX_SESSION_RETRIES + "): " + ex.Message);
                     Log("Aguardando 15s antes de relançar o Edge e retomar de onde parou...");
+
+                    // Se a sessao que crashou fez progresso (curtiu posts), reseta o contador.
+                    // Assim o bot pode reconectar infinitamente desde que cada sessao avance.
+                    if (_totalLikedSession > 0)
+                    {
+                        Log("  (sessao anterior curtiu " + _totalLikedSession + " posts antes de crashar — resetando contador de retries)");
+                        sessionRetries = 0;
+                    }
+                    _totalLikedSession = 0;
                 }
                 finally
                 {
@@ -588,6 +602,7 @@ namespace FIEMGPlayBot
                         done.Add(id);   // dedup em MEMORIA sempre: evita reprocessar/loopar o mesmo post nesta execucao
                         WriteLast(lastPath, id);  // ULTIMO post analisado (sobrescreve sempre, com ou sem ganho)
                         totalLiked++;
+                        _totalLikedSession++;
 
                         // Espaco anti-bloqueio (tambem da tempo do servidor creditar os pontos antes da leitura).
                         await Task.Delay(_rng.Next(_cfg.MinDelayMs, _cfg.MaxDelayMs + 1));
