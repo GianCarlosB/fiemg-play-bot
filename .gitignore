@@ -4,7 +4,8 @@ config.json
 # Artefato de build (regerado pelo run.bat / csc)
 FIEMGPlayBot.exe
 
-# Arquivos de runtime
-done.txt
-last.txt
+# Arquivos de runtime (gerados automaticamente durante a execucao)
+done.txt             # IDs dos posts que renderam pontos (dedup entre execucoes)
+last.txt             # ID do ultimo post analisado (sobrescrito a cada post)
+skip_progress.txt    # Progresso do skip de paginas (retoma apos crash)
 *.log
